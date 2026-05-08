@@ -1,0 +1,137 @@
+"""Feature engineering for the statistical layer.
+
+Two feature scopes:
+
+1. Question-only features (available the moment a market is created — no
+   price history needed). Used at inference time on every active market.
+2. Live-market features (depend on current book state). Adds book midprice,
+   spread, and a longshot-bucket flag from the current YES price.
+
+Both feature sets are computed for training too: at training time, the
+"current YES price" is taken from the last available point of the historical
+prices-history series for the market — i.e. the resolution price, which for
+clean resolutions is 0 or 1. To avoid leaking the label, we use the question-
+only features for training the base-rate prior, and the price-history features
+will feed a separate time-aware model later.
+
+This module returns plain dicts; the LightGBM wrapper converts them to a
+DataFrame.
+"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+
+# Lightweight category keyword lookup. Each tuple is (category_label, regex).
+_CATEGORY_RES: list[tuple[str, re.Pattern]] = [
+    ("crypto", re.compile(r"\b(bitcoin|btc|ether|eth|crypto|solana|sol|altcoin|stablecoin|memecoin|fdv|launch|token|defi)\b", re.I)),
+    ("politics_us", re.compile(r"\b(trump|biden|harris|vance|congress|senate|house|election|primary|impeach|powell|fed|fomc|cfpb|scotus|supreme court|federal)\b", re.I)),
+    ("politics_global", re.compile(r"\b(putin|xi|jinping|netanyahu|zelensky|orban|macron|sunak|starmer|merz|modi|erdogan|kim jong)\b", re.I)),
+    ("geopolitics", re.compile(r"\b(iran|israel|gaza|hamas|hezbollah|ukraine|russia|china|taiwan|north korea|nato|hormuz|red sea|cease[- ]?fire|war|invasion|sanctions)\b", re.I)),
+    ("sports_us", re.compile(r"\b(nba|nfl|mlb|nhl|lakers|warriors|celtics|patriots|cowboys|yankees|dodgers|bruins|rangers|heat|knicks)\b", re.I)),
+    ("sports_global", re.compile(r"\b(world cup|fifa|champions league|premier league|formula 1|f1|tennis|cricket|olympics|rugby)\b", re.I)),
+    ("entertainment", re.compile(r"\b(oscar|grammy|emmy|movie|film|album|netflix|disney|spotify|taylor swift|kardashian)\b", re.I)),
+    ("economy", re.compile(r"\b(cpi|inflation|gdp|unemployment|nfp|recession|fed rate|interest rate|treasury|yield|bond|bls|earnings)\b", re.I)),
+    ("ai", re.compile(r"\b(openai|anthropic|claude|gpt|gemini|llama|mistral|deepseek|chatgpt|model|hugging[\s-]?face|sora)\b", re.I)),
+    ("weather", re.compile(r"\b(hurricane|tornado|earthquake|wildfire|flood|temperature)\b", re.I)),
+]
+
+
+def _category_flags(question: str) -> dict[str, int]:
+    out: dict[str, int] = {f"cat_{name}": 0 for name, _ in _CATEGORY_RES}
+    for name, rx in _CATEGORY_RES:
+        if rx.search(question):
+            out[f"cat_{name}"] = 1
+    return out
+
+
+# Negative-event keywords (analogous to direction.py polarity).
+_NEG_PAT = re.compile(
+    r"\b(out|fired|resign|impeach|leave|lose|loses|fail|fails|default|defaults|fall|falls|drop|drops|ban|bans|war|conflict|invasion|recession|crash|collapse|bankruptcy|strike|attack)\b",
+    re.I,
+)
+_POS_PAT = re.compile(
+    r"\b(win|wins|succeed|approve|pass|passes|rise|rises|deal|agreement|ceasefire|peace|elected|confirm|confirms|above|exceed|hit|hits)\b",
+    re.I,
+)
+_NUM_PAT = re.compile(r"\b(\d[\d,]*\.?\d*)\b")
+_PCT_PAT = re.compile(r"\b\d+(\.\d+)?%")
+_DATE_PAT = re.compile(r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|2024|2025|2026|2027|q1|q2|q3|q4)\b", re.I)
+_DOLLAR_PAT = re.compile(r"\$\s?\d[\d,]*(\.\d+)?[kKmMbB]?\b")
+_K_M_B_PAT = re.compile(r"\b\d+(\.\d+)?\s?[kKmMbB]\b")
+_OVERUNDER_PAT = re.compile(r"\b(o/?u|over|under|spread|moneyline|moneyl)\b", re.I)
+_VS_PAT = re.compile(r"\bvs\.?\b", re.I)
+_COMPARE_PAT = re.compile(r"\b(more than|less than|at least|at most|exceeds?|fall(?:s)? below|hit|reach(?:es)?)\b", re.I)
+_COMPOUND_PAT = re.compile(r"\b(and|or)\b", re.I)
+_NEGATION_PAT = re.compile(r"\b(not|never|won't|wont|fail to)\b", re.I)
+_PROPER_NOUN_RE = re.compile(r"\b[A-Z][a-z]{2,}\b")  # rough capitalized-word heuristic
+
+
+def question_features(
+    question: str,
+    *,
+    liquidity: float = 0.0,
+    volume: float = 0.0,
+    days_to_resolution: float | None = None,
+) -> dict[str, float]:
+    q = question or ""
+    q_lower = q.lower()
+    feats: dict[str, float] = {
+        "q_len_chars": float(len(q)),
+        "q_len_words": float(len(q.split())),
+        "q_has_above": 1.0 if "above" in q_lower else 0.0,
+        "q_has_below": 1.0 if "below" in q_lower else 0.0,
+        "q_has_by": 1.0 if " by " in q_lower else 0.0,
+        "q_has_question_mark": 1.0 if q.endswith("?") else 0.0,
+        "q_neg_event_hits": float(len(_NEG_PAT.findall(q_lower))),
+        "q_pos_event_hits": float(len(_POS_PAT.findall(q_lower))),
+        "q_num_count": float(len(_NUM_PAT.findall(q))),
+        "q_pct_count": float(len(_PCT_PAT.findall(q))),
+        "q_date_token_count": float(len(_DATE_PAT.findall(q))),
+        "liquidity": float(liquidity or 0.0),
+        "volume": float(volume or 0.0),
+        "log_liquidity": float(__import__("math").log1p(max(0.0, float(liquidity or 0.0)))),
+        "log_volume": float(__import__("math").log1p(max(0.0, float(volume or 0.0)))),
+        # New features (improvements 11 + 12 + extras)
+        "q_has_dollar": 1.0 if _DOLLAR_PAT.search(q) or _K_M_B_PAT.search(q) else 0.0,
+        "q_dollar_count": float(len(_DOLLAR_PAT.findall(q))),
+        "q_has_overunder": 1.0 if _OVERUNDER_PAT.search(q) else 0.0,
+        "q_has_vs": 1.0 if _VS_PAT.search(q) else 0.0,
+        "q_starts_will": 1.0 if q_lower.startswith("will ") else 0.0,
+        "q_compare_count": float(len(_COMPARE_PAT.findall(q))),
+        "q_has_and_or": 1.0 if _COMPOUND_PAT.search(q) else 0.0,
+        "q_has_negation": 1.0 if _NEGATION_PAT.search(q) else 0.0,
+        "q_proper_nouns": float(len(_PROPER_NOUN_RE.findall(q))),
+        "q_polarity_diff": float(
+            len(_NEG_PAT.findall(q_lower)) - len(_POS_PAT.findall(q_lower))
+        ),
+        # Time-to-resolution: how far from now (positive = future). NaN-safe.
+        "days_to_resolution": float(days_to_resolution) if days_to_resolution is not None else 0.0,
+        "has_ttr": 1.0 if days_to_resolution is not None else 0.0,
+        "log1p_ttr": float(__import__("math").log1p(max(0.0, float(days_to_resolution or 0.0)))),
+    }
+    feats.update({k: float(v) for k, v in _category_flags(q).items()})
+    return feats
+
+
+@dataclass
+class BookSnapshot:
+    yes_mid: float | None = None
+    no_mid: float | None = None
+    yes_spread: float | None = None
+    yes_best_ask: float | None = None
+    yes_best_bid: float | None = None
+
+
+def live_features(question: str, snap: BookSnapshot, *, liquidity: float = 0.0, volume: float = 0.0) -> dict[str, float]:
+    feats = question_features(question, liquidity=liquidity, volume=volume)
+    if snap.yes_mid is not None:
+        feats["mkt_yes_mid"] = float(snap.yes_mid)
+        # Longshot bucket from current price
+        feats["mkt_longshot_yes"] = 1.0 if snap.yes_mid <= 0.10 else 0.0
+        feats["mkt_favorite_yes"] = 1.0 if snap.yes_mid >= 0.90 else 0.0
+        feats["mkt_midrange_yes"] = 1.0 if 0.40 <= snap.yes_mid <= 0.60 else 0.0
+    if snap.yes_spread is not None:
+        feats["mkt_spread"] = float(snap.yes_spread)
+    return feats

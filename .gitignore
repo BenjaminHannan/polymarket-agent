@@ -1,0 +1,52 @@
+# --- secrets ---
+.env
+.env.local
+.env.*.local
+*.key
+*.pem
+secrets/
+
+# --- python build/cache ---
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# --- venvs ---
+.venv/
+venv/
+env/
+
+# --- runtime data: sqlite, model artifacts, logs, telegram session ---
+data/
+*.log
+*.db
+*.db-shm
+*.db-wal
+*.joblib
+tdlib_session/
+
+# --- OS / editor cruft ---
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# --- Claude / local agent metadata ---
+.claude/
+
+# --- model caches that sometimes get checked-in by accident ---
+huggingface_cache/
+.cache/
+*.safetensors
+*.bin
