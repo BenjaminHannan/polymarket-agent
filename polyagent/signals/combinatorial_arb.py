@@ -178,6 +178,15 @@ class CombinatorialArb:
         #    sum < 1 - threshold, you can buy YES on every outcome and lock
         #    in (1 - sum) profit. If sum > 1 + threshold, buy NO on every
         #    outcome to lock the inverse.
+        #
+        # **Partial-group artifact filter** (added after Week 4 backtest;
+        # see scripts/backtest_negrisk_arb.py). We stream top-N markets by
+        # liquidity, so a NegRisk event with 10+ candidates often shows
+        # only 4 in our set — partial sum is near zero, scanner reports
+        # "99pp edge" which is an artifact, not a real arb. Skip
+        # sum_yes < ``min_complete_group_sum`` (default 0.30): a real
+        # NegRisk group should have most of its mass visible.
+        MIN_COMPLETE_GROUP_SUM = 0.30
         for event_id, group in self._negrisk_events.items():
             asks = []
             for m in group:
@@ -193,6 +202,9 @@ class CombinatorialArb:
             if asks is None or len(asks) < 2:
                 continue
             sum_yes = sum(p for _, p in asks)
+            # Skip incomplete groups (Week 4 backtest finding).
+            if sum_yes < MIN_COMPLETE_GROUP_SUM:
+                continue
             if sum_yes < 1.0 - self.min_violation:
                 violations.append(
                     {
