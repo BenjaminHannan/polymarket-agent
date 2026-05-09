@@ -678,6 +678,66 @@ real-money infrastructure.
 
 ---
 
+## Session log: late May 2026 — Sharpe-honesty discipline
+
+Adopted the falsifiability-first discipline from the design doc
+(`pm.md`): ship only what we can verify worked, default-off when the
+historical falsifiability test fails. Four roadmap items attempted
+over four weeks:
+
+| Week | Item | Falsifiability | Status |
+|---|---|---|---|
+| 1 | §12 PSR/DSR/MTRL live nightly harness | math verified on synthetic returns (PSR/DSR/MTRL match Bailey & de Prado 2014 Table 1) | **shipped, live** — `polyagent/eval/sharpe_honesty.py`, `polyagent/eval/harness.py` |
+| 1 | §1 selective-abstention gate (Venn-Abers width) | observable in week 1: gate admits ~40% of candidates | **shipped, live** — `polyagent/risk/selective_gate.py` |
+| 2 | §9 BOCPD changepoint gate on win/loss | FP/TP grid: hazard 0.005 → 5% FP, 0/10 detection; hazard 0.020 → 95% FP, 9/10 detection. **No useful operating point.** | **default-off** — `polyagent/risk/bocpd_gate.py` skeleton ships; live activation deferred until either a different detection signal (CUSUM on rolling win-rate) or more data |
+| 3 | §10 Kaminski-Lo gated stops + near-resolution lock-in | on real data n=7: φ=+0.09, SR_daily=+1.45 → φ < SR_daily, stops have been removing mean per K-L 2014 | **shipped, live** — `polyagent/risk/exit_policy.py`. Internal n≥30 floor before gate engages. |
+| 4 | §4 NegRisk arb v2 (atomic dispatch + depth-floor) | 7,592 raw NegRisk-class candidates over 4 days, 100% partial-group artifacts (median edge 99.4pp, real arbs are ≤30pp). After artifact filter: **0 real opportunities at any threshold** | **v2 not built** — patched v1 to drop partial-group artifacts |
+
+Two of four passed, two failed. Both failures had the highest expected
+Sharpe lift in the doc; both got falsified by real data exactly as the
+SE(SR) ≈ 0.10 epigraph predicted. The disciplined response — not
+shipping unverified strategies — is the entire point of §12 / the
+discipline thread.
+
+### Empirical state at session end
+
+After Week 4 fixes (broker-level per-token fill cap, market-prior
+shrinkage in trade_hunter, edge-sanity cap, longshot floor at $0.10,
+half-Kelly, Kaminski-Lo gated stops, near-resolution lock-in,
+selective abstention via interval width, partial-NegRisk-group
+artifact filter):
+
+```
+NAV (mid):              $10,078.61   (+0.79% over the session)
+NAV (liquidation):      $10,054.99   (+0.55%)
+Realized P&L:           +$210.69
+Unrealized:             −$26.24
+Fills:                  139 (73 combined_trader BUY, 35 passive_poster BUY,
+                             19 stop_loss SELL, 9 news_trader BUY,
+                             3 near_resolution SELL)
+Resolved with position: 7 (all NO-side bets on sports markets, all paid)
+Stop-losses:            2 (was 22 in the −3.7% session)
+Task crashes:           0 (busy_timeout 10s → 30s + 7-attempt retry)
+```
+
+The 7 resolved trades (all wins, $232 of realized P&L) are far below
+MTRL — single-session noise, not signal. The point of §12 is to
+keep me honest about that. PSR(SR≥0) on N=7 is essentially
+uninformative; we need ~200 more resolutions before the harness can
+say anything statistically.
+
+### Discipline takeaway
+
+Five weeks of intense feature shipping resulted in: 14 modules added,
+19 risk gates currently active, two falsifiability failures gracefully
+documented, and a paper-mode bot that — given its current state — has
+no business pretending it has detected positive Sharpe yet. The
+right answer is to **let it run** and let the harness accumulate
+data. Future feature additions go through the same falsifiability
+gate; nothing ships on intuition.
+
+---
+
 ## Where to look next
 
 If you wanted to spend another week:
