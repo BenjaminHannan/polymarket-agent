@@ -50,6 +50,7 @@ from polyagent.queue_model import (
     cancel_latency_slippage,
     fill_prob_top_of_book,
 )
+from polyagent.risk.selective_gate import SelectiveGate
 from polyagent.risk.smart_money import SmartMoneyRegistry
 
 log = structlog.get_logger()
@@ -83,6 +84,7 @@ class PassivePoster:
     max_spread: float = 0.10
     min_spread: float = 0.005
     smart_money: SmartMoneyRegistry | None = None
+    selective_gate: SelectiveGate | None = None
     strategy_name: str = "passive_poster"
 
     # In-flight posts indexed by token_id (only one post per token at a time)
@@ -127,10 +129,16 @@ class PassivePoster:
         p_combined: float,
         p_market: float,
         category: str,
+        p_combined_low: float | None = None,
+        p_combined_high: float | None = None,
     ) -> None:
         """Receive a combined-signal candidate and decide whether to post a
         passive limit. Lower edge bar than the taker trader because the
         half-spread we capture compensates."""
+        # Selective-abstention gate (§1) — same as combined_trader.
+        if self.selective_gate is not None:
+            if not self.selective_gate.admit(p_combined_low, p_combined_high, category):
+                return
         edge = p_combined - p_market
         if abs(edge) < self.min_edge:
             return

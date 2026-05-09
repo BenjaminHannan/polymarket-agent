@@ -146,6 +146,17 @@ class Settings:
     passive_poster_max_spread: float = float(os.getenv("PASSIVE_POSTER_MAX_SPREAD", "0.10"))
     passive_poster_min_spread: float = float(os.getenv("PASSIVE_POSTER_MIN_SPREAD", "0.005"))
 
+    # §12 — live Sharpe-honesty harness (DSR/PSR/MTRL nightly).
+    enable_sharpe_harness: bool = os.getenv("ENABLE_SHARPE_HARNESS", "1") == "1"
+    enable_strategy_cert_gate: bool = os.getenv("ENABLE_STRATEGY_CERT_GATE", "1") == "1"
+
+    # §1 — selective-abstention gate. Width-based: admits the
+    # ``selective_gate_coverage`` fraction of candidates by Venn-Abers
+    # interval width. Burn-in returns admit=True for the first N calls.
+    enable_selective_gate: bool = os.getenv("ENABLE_SELECTIVE_GATE", "1") == "1"
+    selective_gate_coverage: float = float(os.getenv("SELECTIVE_GATE_COVERAGE", "0.40"))
+    selective_gate_burn_in: int = int(os.getenv("SELECTIVE_GATE_BURN_IN", "200"))
+
     # Per-message → market LLM matcher (structured (confidence, direction,
     # reason_short) signals). Idempotent under news dedup; no-op without
     # local LLM. Cheap to leave on.

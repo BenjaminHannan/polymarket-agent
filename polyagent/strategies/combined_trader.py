@@ -31,6 +31,7 @@ from polyagent.gamma import Market
 from polyagent.orderbook import BookStore
 from polyagent.paper_broker import PaperBroker
 from polyagent.risk.adverse_selection import AdverseSelectionFilter
+from polyagent.risk.selective_gate import SelectiveGate
 from polyagent.risk.smart_money import SmartMoneyRegistry
 from polyagent.risk.throttle import StrategyThrottler
 
@@ -106,6 +107,10 @@ class CombinedTrader:
     # News-store handle so we can look up recent market activity associated
     # with smart wallets (set externally; we never construct it ourselves).
     news_store: object | None = None
+    # Selective-abstention gate (§1). When set, on_signal rejects
+    # candidates whose Venn-Abers interval width is above the
+    # target-coverage quantile of recent widths.
+    selective_gate: SelectiveGate | None = None
 
     def threshold(self, category: str) -> float:
         return self.theta_min_by_category.get(category, self.theta_min_default)
@@ -167,6 +172,7 @@ class CombinedTrader:
         p_market: float,
         category: str,
         p_combined_low: float | None = None,
+        p_combined_high: float | None = None,
     ) -> None:
         self._reset_day_if_needed()
 
@@ -183,6 +189,22 @@ class CombinedTrader:
         # Volume gate
         if (market.volume_24h or 0) < self.min_volume_24h_usd:
             return
+
+        # SELECTIVE-ABSTENTION GATE (§1; Geifman & El-Yaniv NIPS 2017,
+        # Bai & Jin 2026). Refuse signals whose Venn-Abers interval is
+        # too wide — i.e., the model is too uncertain about this
+        # particular market. Tracks recent widths globally; admits the
+        # top ``target_coverage`` fraction by confidence. Falls through
+        # when no interval is available.
+        if self.selective_gate is not None:
+            if not self.selective_gate.admit(p_combined_low, p_combined_high, category):
+                log.info(
+                    "combined_trade_skip_selective_gate",
+                    category=category,
+                    p_low=round(p_combined_low, 4) if p_combined_low is not None else None,
+                    p_high=round(p_combined_high, 4) if p_combined_high is not None else None,
+                )
+                return
 
         edge_raw = p_combined - p_market
         # EDGE SANITY CAP (Della Vedova 2026 / Whelan 2024). A claim of

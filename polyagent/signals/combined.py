@@ -314,22 +314,33 @@ class CombinedSignaler:
                     continue
                 # Conformal lower bound on the stat_lgbm output (idea #9):
                 # propagate the Venn-Abers / cell-calibrator interval so the
-                # trader can size off a worst-case probability. If we don't
-                # have an interval (cell didn't get enough samples), pass
-                # the point estimate through — strategies become no-ops.
+                # trader can size off a worst-case probability AND so the
+                # selective-abstention gate (§1) can compute width. If we
+                # don't have an interval (cell didn't get enough samples),
+                # pass the point estimate through — strategies become no-ops.
                 p_low_stat = pred.get("calibrated_low")
                 p_high_stat = pred.get("calibrated_high")
-                # Reapply the same log-pool to the lower-bound stat expert
-                # to get a lower-bound combined p — only when stat is in
-                # the expert list.
+                # Reapply the same log-pool to the lower-bound and upper-
+                # bound stat experts to get bounded combined probabilities
+                # — only when stat is in the expert list.
                 p_combined_low = p_combined
+                p_combined_high = p_combined
                 if p_low_stat is not None and "stat_lgbm" in expert_names:
+                    idx_stat = expert_names.index("stat_lgbm")
                     ordered_low = list(ordered)
-                    ordered_low[expert_names.index("stat_lgbm")] = float(p_low_stat)
+                    ordered_low[idx_stat] = float(p_low_stat)
                     try:
                         p_combined_low = log_pool(ordered_low, effective_weights)
                     except Exception:
                         p_combined_low = p_combined
+                if p_high_stat is not None and "stat_lgbm" in expert_names:
+                    idx_stat = expert_names.index("stat_lgbm")
+                    ordered_high = list(ordered)
+                    ordered_high[idx_stat] = float(p_high_stat)
+                    try:
+                        p_combined_high = log_pool(ordered_high, effective_weights)
+                    except Exception:
+                        p_combined_high = p_combined
                 direction = "yes" if edge > 0 else "no"
                 # Microstructure context (informational, not yet in the
                 # log-pool — but useful for downstream traders to gate on)
@@ -386,6 +397,7 @@ class CombinedSignaler:
                             p_market=p_market,
                             category=used_cat,
                             p_combined_low=p_combined_low,
+                            p_combined_high=p_combined_high,
                         )
                     except Exception as e:
                         log.warning("combined_trader_error", err=str(e))

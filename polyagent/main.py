@@ -31,8 +31,10 @@ from polyagent.dashboard import Dashboard
 from polyagent.models.llm_forecaster import LLMForecaster
 from polyagent.models.news_embed_matcher import SemanticMarketIndex
 from polyagent.models.psi_monitor import PSIMonitor
+from polyagent.eval.harness import SharpeHarness, StrategyCertRegistry
 from polyagent.risk.adverse_selection import AdverseSelectionFilter
 from polyagent.risk.live_ece import LiveECEMonitor
+from polyagent.risk.selective_gate import SelectiveGate
 from polyagent.risk.smart_money import SmartMoneyRegistry
 from polyagent.risk.wash_filter import WashFilter
 from polyagent.signals.combinatorial_arb import CombinatorialArb
@@ -183,6 +185,20 @@ async def run() -> None:
     smart_money = SmartMoneyRegistry.load()
     psi_monitor = PSIMonitor(db_path=settings.db_path)
     live_ece = LiveECEMonitor(db_path=settings.db_path)
+    # §12 — live Sharpe-honesty harness (DSR/PSR/MTRL nightly).
+    sharpe_harness = SharpeHarness(db_path=settings.db_path) if settings.enable_sharpe_harness else None
+    cert_registry = StrategyCertRegistry(db_path=settings.db_path) if settings.enable_strategy_cert_gate else None
+    # §1 — selective-abstention gate. One instance shared across both
+    # combined_trader and passive_poster so the width buffer captures
+    # the full distribution of candidate signals.
+    selective_gate = (
+        SelectiveGate(
+            target_coverage=settings.selective_gate_coverage,
+            burn_in=settings.selective_gate_burn_in,
+        )
+        if settings.enable_selective_gate
+        else None
+    )
 
     # Shared predictor: used by stat signaler, combined signaler, and the
     # resolution watcher's outcome materializer. Loaded once.
@@ -293,6 +309,10 @@ async def run() -> None:
         _spawn("smart_money", lambda: smart_money.run()),
         _spawn("psi_monitor", lambda: psi_monitor.run()),
         _spawn("live_ece", lambda: live_ece.run()),
+        *(
+            [_spawn("sharpe_harness", lambda: sharpe_harness.run())]
+            if sharpe_harness is not None else []
+        ),
         _spawn(
             "dashboard",
             lambda: Dashboard(
@@ -354,6 +374,7 @@ async def run() -> None:
                 adverse_filter=adverse_filter,
                 smart_money=smart_money,
                 news_store=news_store,
+                selective_gate=selective_gate,
             )
         # Shared LLM forecaster + consistency-check state. The runtime task
         # populates `consistency.state[event_id]` and CombinedSignaler reads
@@ -384,10 +405,12 @@ async def run() -> None:
                 max_spread=settings.passive_poster_max_spread,
                 min_spread=settings.passive_poster_min_spread,
                 smart_money=smart_money,
+                selective_gate=selective_gate,
             )
 
         async def _on_combined_signal(
-            *, market, p_combined, p_market, category, p_combined_low=None
+            *, market, p_combined, p_market, category,
+            p_combined_low=None, p_combined_high=None,
         ):
             # Fan a single signal out to taker (combined_trader) and maker
             # (passive_poster). Both apply their own gates independently.
@@ -399,13 +422,17 @@ async def run() -> None:
                         p_market=p_market,
                         category=category,
                         p_combined_low=p_combined_low,
+                        p_combined_high=p_combined_high,
                     )
                 except Exception as e:
                     log.warning("combined_trader_fanout_error", err=str(e))
             if passive_poster is not None:
                 try:
                     await passive_poster.on_signal(
-                        market=market, p_combined=p_combined, p_market=p_market, category=category,
+                        market=market, p_combined=p_combined, p_market=p_market,
+                        category=category,
+                        p_combined_low=p_combined_low,
+                        p_combined_high=p_combined_high,
                     )
                 except Exception as e:
                     log.warning("passive_poster_fanout_error", err=str(e))
