@@ -34,6 +34,7 @@ from polyagent.models.psi_monitor import PSIMonitor
 from polyagent.eval.harness import SharpeHarness, StrategyCertRegistry
 from polyagent.risk.adverse_selection import AdverseSelectionFilter
 from polyagent.risk.bocpd_gate import BOCPDGate
+from polyagent.risk.exit_policy import KaminskiLoStopGate, NearResolutionLockIn
 from polyagent.risk.live_ece import LiveECEMonitor
 from polyagent.risk.selective_gate import SelectiveGate
 from polyagent.risk.smart_money import SmartMoneyRegistry
@@ -200,6 +201,22 @@ async def run() -> None:
         if settings.enable_selective_gate
         else None
     )
+    # §10 — Kaminski-Lo stop gate + near-resolution lock-in.
+    kl_gate = (
+        KaminskiLoStopGate(db_path=settings.db_path)
+        if settings.enable_kaminski_lo_gate
+        else None
+    )
+    near_resolution = (
+        NearResolutionLockIn(
+            min_unrealized_pct=settings.near_resolution_min_unrealized_pct,
+            max_hours_to_resolution=settings.near_resolution_max_hours,
+            min_lock_value_usd=settings.near_resolution_min_lock_usd,
+        )
+        if settings.enable_near_resolution_lock_in
+        else None
+    )
+
     # §9 — BOCPD changepoint gate. Fed by the resolution_watcher with
     # win/loss outcomes; consulted by both traders for a global size
     # multiplier during detected regime changes.
@@ -346,6 +363,9 @@ async def run() -> None:
                 book_store=book_store,
                 threshold_pct=settings.stop_loss_threshold_pct,
                 interval_sec=settings.stop_loss_interval_sec,
+                kaminski_lo_gate=kl_gate,
+                near_resolution=near_resolution,
+                held_tracker=held_tracker,
             ),
         ),
         _spawn(

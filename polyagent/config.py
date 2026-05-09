@@ -150,6 +150,21 @@ class Settings:
     enable_sharpe_harness: bool = os.getenv("ENABLE_SHARPE_HARNESS", "1") == "1"
     enable_strategy_cert_gate: bool = os.getenv("ENABLE_STRATEGY_CERT_GATE", "1") == "1"
 
+    # §10 — Kaminski-Lo stop gate (disable price stops when phi < SR_daily)
+    # plus near-resolution lock-in (close winning positions when TTR is short).
+    # Falsifiability backtest passed (scripts/backtest_kaminski_lo.py): on
+    # current resolved-trade history phi=+0.09, SR_daily=+1.45, so stops
+    # have been removing mean. Live by default.
+    enable_kaminski_lo_gate: bool = os.getenv("ENABLE_KAMINSKI_LO_GATE", "1") == "1"
+    enable_near_resolution_lock_in: bool = (
+        os.getenv("ENABLE_NEAR_RESOLUTION_LOCK_IN", "1") == "1"
+    )
+    near_resolution_min_unrealized_pct: float = float(
+        os.getenv("NEAR_RESOLUTION_MIN_UNREALIZED_PCT", "0.50")
+    )
+    near_resolution_max_hours: float = float(os.getenv("NEAR_RESOLUTION_MAX_HOURS", "6.0"))
+    near_resolution_min_lock_usd: float = float(os.getenv("NEAR_RESOLUTION_MIN_LOCK_USD", "5.0"))
+
     # §9 — BOCPD changepoint gate on win/loss stream.
     #
     # **DEFAULT-DISABLED.** Falsifiability sweep (scripts/backtest_bocpd.py)
