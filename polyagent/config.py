@@ -150,6 +150,23 @@ class Settings:
     enable_sharpe_harness: bool = os.getenv("ENABLE_SHARPE_HARNESS", "1") == "1"
     enable_strategy_cert_gate: bool = os.getenv("ENABLE_STRATEGY_CERT_GATE", "1") == "1"
 
+    # §9 — BOCPD changepoint gate on win/loss stream.
+    #
+    # **DEFAULT-DISABLED.** Falsifiability sweep (scripts/backtest_bocpd.py)
+    # showed the FP/TP tradeoff has no useful operating point on a
+    # Bernoulli win/loss stream:
+    #   hazard 0.005 → 5% FP rate, but 0/10 real-shift detection
+    #   hazard 0.020 → 95% FP rate, real shifts detected in 9/10 seeds
+    # The skeleton ships so the wiring is in place; flip ENABLE_BOCPD_GATE=1
+    # only after either (a) implementing a less-noisy detection signal
+    # (e.g. CUSUM on per-window win rate) or (b) accumulating enough
+    # resolved-trade data to recalibrate.
+    enable_bocpd_gate: bool = os.getenv("ENABLE_BOCPD_GATE", "0") == "1"
+    bocpd_hazard: float = float(os.getenv("BOCPD_HAZARD", "0.02"))
+    bocpd_cp_threshold: float = float(os.getenv("BOCPD_CP_THRESHOLD", "0.7"))
+    bocpd_deleverage_trades: int = int(os.getenv("BOCPD_DELEVERAGE_TRADES", "30"))
+    bocpd_deleverage_mult: float = float(os.getenv("BOCPD_DELEVERAGE_MULT", "0.5"))
+
     # §1 — selective-abstention gate. Width-based: admits the
     # ``selective_gate_coverage`` fraction of candidates by Venn-Abers
     # interval width. Burn-in returns admit=True for the first N calls.

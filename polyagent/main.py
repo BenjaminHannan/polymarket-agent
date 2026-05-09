@@ -33,6 +33,7 @@ from polyagent.models.news_embed_matcher import SemanticMarketIndex
 from polyagent.models.psi_monitor import PSIMonitor
 from polyagent.eval.harness import SharpeHarness, StrategyCertRegistry
 from polyagent.risk.adverse_selection import AdverseSelectionFilter
+from polyagent.risk.bocpd_gate import BOCPDGate
 from polyagent.risk.live_ece import LiveECEMonitor
 from polyagent.risk.selective_gate import SelectiveGate
 from polyagent.risk.smart_money import SmartMoneyRegistry
@@ -199,6 +200,19 @@ async def run() -> None:
         if settings.enable_selective_gate
         else None
     )
+    # §9 — BOCPD changepoint gate. Fed by the resolution_watcher with
+    # win/loss outcomes; consulted by both traders for a global size
+    # multiplier during detected regime changes.
+    bocpd_gate = (
+        BOCPDGate(
+            hazard=settings.bocpd_hazard,
+            cp_threshold=settings.bocpd_cp_threshold,
+            deleverage_trades=settings.bocpd_deleverage_trades,
+            deleverage_mult=settings.bocpd_deleverage_mult,
+        )
+        if settings.enable_bocpd_gate
+        else None
+    )
 
     # Shared predictor: used by stat signaler, combined signaler, and the
     # resolution watcher's outcome materializer. Loaded once.
@@ -299,7 +313,9 @@ async def run() -> None:
         _spawn("news_stats_loop", lambda: news_stats_loop(news_store)),
         _spawn(
             "resolution_watcher",
-            lambda: resolution_watcher_mod.run(broker, held_tracker, predictor=shared_predictor),
+            lambda: resolution_watcher_mod.run(
+                broker, held_tracker, predictor=shared_predictor, bocpd_gate=bocpd_gate,
+            ),
         ),
         _spawn(
             "throttler",
@@ -375,6 +391,7 @@ async def run() -> None:
                 smart_money=smart_money,
                 news_store=news_store,
                 selective_gate=selective_gate,
+                bocpd_gate=bocpd_gate,
             )
         # Shared LLM forecaster + consistency-check state. The runtime task
         # populates `consistency.state[event_id]` and CombinedSignaler reads
@@ -406,6 +423,7 @@ async def run() -> None:
                 min_spread=settings.passive_poster_min_spread,
                 smart_money=smart_money,
                 selective_gate=selective_gate,
+                bocpd_gate=bocpd_gate,
             )
 
         async def _on_combined_signal(

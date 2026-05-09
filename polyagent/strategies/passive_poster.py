@@ -85,6 +85,7 @@ class PassivePoster:
     min_spread: float = 0.005
     smart_money: SmartMoneyRegistry | None = None
     selective_gate: SelectiveGate | None = None
+    bocpd_gate: object | None = None
     strategy_name: str = "passive_poster"
 
     # In-flight posts indexed by token_id (only one post per token at a time)
@@ -225,7 +226,15 @@ class PassivePoster:
         # Ensure expected fill price is still profitable vs model.
         if side == "BUY" and post_price >= p:
             return  # negative expected value at this post price
-        target_size = self.per_post_notional / max(0.01, post_price)
+        # BOCPD deleverage multiplier (§9): scale notional during a
+        # detected regime-change cooldown.
+        bocpd_scale = 1.0
+        if self.bocpd_gate is not None:
+            try:
+                bocpd_scale = float(self.bocpd_gate.size_multiplier())
+            except Exception:
+                bocpd_scale = 1.0
+        target_size = (self.per_post_notional * bocpd_scale) / max(0.01, post_price)
         order = _PostedOrder(
             market=market,
             token_id=token_id,

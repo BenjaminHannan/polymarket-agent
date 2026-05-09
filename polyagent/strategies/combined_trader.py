@@ -111,6 +111,11 @@ class CombinedTrader:
     # candidates whose Venn-Abers interval width is above the
     # target-coverage quantile of recent widths.
     selective_gate: SelectiveGate | None = None
+    # BOCPD changepoint gate (§9). Provides a global size multiplier
+    # (1.0 normally, 0.5 for K trades after a detected regime change
+    # in win-rate). Multiplied into the Kelly stack alongside
+    # dd_scale × bandit_scale × throttle.
+    bocpd_gate: object | None = None
 
     def threshold(self, category: str) -> float:
         return self.theta_min_by_category.get(category, self.theta_min_default)
@@ -417,9 +422,17 @@ class CombinedTrader:
         # early samples explore widely; mature categories converge.
         bandit_scale = self.bandit_sample(category)
 
+        # BOCPD size multiplier — 1.0 normally, deleverage_mult while a
+        # regime-change cooldown is active. Cheap to read on every trade.
+        bocpd_scale = 1.0
+        if self.bocpd_gate is not None:
+            try:
+                bocpd_scale = float(self.bocpd_gate.size_multiplier())
+            except Exception:
+                bocpd_scale = 1.0
         f_used = min(
             self.max_per_trade_kelly,
-            self.kelly_mult * f_full * throttle * dd_scale * bandit_scale,
+            self.kelly_mult * f_full * throttle * dd_scale * bandit_scale * bocpd_scale,
         )
         if f_used <= 0:
             return

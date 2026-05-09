@@ -24,7 +24,10 @@ venv/
 env/
 
 # --- runtime data: sqlite, model artifacts, logs, telegram session ---
-data/
+# anchor /data/ to repo root — was just `data/` which also matched
+# `polyagent/data/` (the news-ingest source modules) and silently
+# excluded them from the initial commit. Caught after week-2 ship.
+/data/
 *.log
 *.db
 *.db-shm
