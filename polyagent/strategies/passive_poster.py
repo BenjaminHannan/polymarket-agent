@@ -165,6 +165,29 @@ class PassivePoster:
         wf = getattr(self.book_store, "wash_filter", None)
         if wf is not None and wf.is_blacklisted(token_id):
             return
+        # Stop-loss re-entry block (mirror of combined_trader)
+        if self.broker.was_recently_stopped(token_id) or (
+            market.condition_id and self.broker.was_recently_stopped(market.condition_id)
+        ):
+            return
+        # Hard per-token fill cap (broker-level)
+        if self.broker.is_token_buy_capped(token_id):
+            return
+        # Averaging-down guard: refuse to add to a losing position. The
+        # most expensive losses in the previous session were passive
+        # posts averaging in as the price fell from $0.41 → $0.34 →
+        # stop-loss at $0.19. If we already hold this token AND the
+        # current mid is below avg_cost, do not post — the previous
+        # entry was wrong, more of the same isn't going to fix it.
+        existing = self.broker.positions.get(token_id)
+        if existing and existing.size > 0 and existing.avg_cost > 0:
+            book_now = self.book_store.books.get(token_id)
+            mid_now = book_now.mid() if book_now is not None else None
+            if mid_now is not None and mid_now < existing.avg_cost * 0.97:
+                # 3% relative drop is enough to refuse — passive is
+                # designed to nibble inside the spread; any drift this
+                # large means the model's edge claim is stale.
+                return
 
         book = self.book_store.books.get(token_id)
         if not self._eligible(book):

@@ -87,7 +87,10 @@ class NewsStore:
         self.db = await aiosqlite.connect(self.db_path, timeout=30.0)
         await self.db.execute("PRAGMA journal_mode=WAL")
         await self.db.execute("PRAGMA synchronous=NORMAL")
-        await self.db.execute("PRAGMA busy_timeout=10000")
+        # Bumped to 30s — running 25+ supervised tasks against one
+        # SQLite file with WAL means occasional reader-vs-writer
+        # contention spikes; a generous busy_timeout absorbs them.
+        await self.db.execute("PRAGMA busy_timeout=30000")
         await self.db.executescript(
             """
             CREATE TABLE IF NOT EXISTS news (
@@ -165,11 +168,14 @@ class NewsStore:
         if self.db is None:
             return
         # Sustained-write contention can occasionally beat the
-        # busy_timeout. Retry a few times with backoff so transient
-        # OperationalError doesn't crash the supervised task.
+        # busy_timeout. Retry with bounded exponential backoff so
+        # transient OperationalErrors don't crash the supervised task.
+        # 7 attempts with backoff 0.2/0.4/0.8/1.6/3.2/6.4 = ~12s total
+        # before we give up and let the supervisor restart us.
         import asyncio as _aio
         import sqlite3 as _sq3
-        for attempt in range(4):
+        last_err: Exception | None = None
+        for attempt in range(7):
             try:
                 await self.db.execute(
                     "INSERT INTO signals(ts, strategy, condition_id, direction, score, news_hash, detail) VALUES (?,?,?,?,?,?,?)",
@@ -178,10 +184,29 @@ class NewsStore:
                 await self.db.commit()
                 return
             except _sq3.OperationalError as e:
-                if "locked" in str(e).lower() and attempt < 3:
+                last_err = e
+                if "locked" in str(e).lower() and attempt < 6:
                     await _aio.sleep(0.2 * (2 ** attempt))
                     continue
-                raise
+                # Non-recoverable or budget exhausted — DROP the row
+                # silently rather than crash the task. A missed signal
+                # row is far cheaper than 30s of supervisor downtime.
+                log.warning(
+                    "insert_signal_dropped",
+                    strategy=strategy,
+                    condition_id=condition_id[:14],
+                    err=str(e),
+                    attempts=attempt + 1,
+                )
+                return
+            except Exception as e:
+                last_err = e
+                log.warning(
+                    "insert_signal_unexpected_error",
+                    strategy=strategy,
+                    err=str(e),
+                )
+                return
 
     async def news_velocity(self, condition_id: str, short_sec: float = 3600.0, long_sec: float = 86400.0) -> tuple[int, int, float] | None:
         """Returns (n_short, n_long, velocity_ratio) for a market.

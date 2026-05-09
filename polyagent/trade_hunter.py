@@ -150,9 +150,37 @@ class TradeHunter:
                     else:
                         expert_probs[name] = 0.5
                 ordered = [expert_probs[n] for n in expert_names]
-                p_combined = log_pool(ordered, weights)
+                # MARKET-PRIOR SHRINKAGE (mirror of combined.py — must be
+                # applied here because TradeHunter is the dominant fill
+                # source). Trained combiner often gives p_market < 0.10
+                # weight even though the literature mandates >= 0.6 for
+                # question-only models. Enforce that floor at runtime.
+                effective_weights = list(weights)
+                MARKET_WEIGHT_FLOOR = 0.60
+                m_idx = None
+                for i, n in enumerate(expert_names):
+                    if n.startswith("p_market") or n == "market":
+                        m_idx = i
+                        break
+                if m_idx is not None and effective_weights[m_idx] < MARKET_WEIGHT_FLOOR:
+                    others = sum(
+                        w for j, w in enumerate(effective_weights) if j != m_idx
+                    )
+                    if others > 0:
+                        scale = (1.0 - MARKET_WEIGHT_FLOOR) / others
+                        effective_weights = [
+                            (MARKET_WEIGHT_FLOOR if j == m_idx else w * scale)
+                            for j, w in enumerate(effective_weights)
+                        ]
+                p_combined = log_pool(ordered, effective_weights)
                 edge = p_combined - p_market
                 if abs(edge) < self.min_abs_edge:
+                    continue
+                # EDGE SANITY CAP: refuse claims of edge bigger than the
+                # market's own implicit prior (Della Vedova 2026). An
+                # AUC=0.77 question-only model has no statistical right
+                # to claim a 25pp gap on a 3¢ market.
+                if abs(edge) > min(p_market, 1.0 - p_market):
                     continue
                 # Skip implausibly large edges — these are almost always
                 # model overconfidence on familiar question patterns rather

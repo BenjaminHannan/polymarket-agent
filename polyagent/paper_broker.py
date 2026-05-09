@@ -68,6 +68,21 @@ class PaperBroker:
     # the first 100 fills, well above the 5% block threshold.
     _pess_gate_window_fills: int = 100
     _pess_gate_block_pct: float = 0.05  # 5% of starting NAV
+    # Tokens that recently took a stop-loss. Strategies that read this set
+    # via `was_recently_stopped()` won't re-buy them — the model's
+    # "edge" persisted through the loss is exactly the same hallucination
+    # that produced the loss in the first place.
+    recently_stopped: dict[str, float] = field(default_factory=dict)
+    stop_loss_blacklist_sec: float = 86400.0   # 24h
+    # Hard per-token fill cap. Any strategy is allowed at most
+    # ``max_buys_per_token_window`` BUYs per token within
+    # ``buys_per_token_window_sec``. Prevents the cycling-fill pattern
+    # where a single token accumulates 20+ fills as the model keeps
+    # emitting the same edge claim. Counter is reset by stop-losses
+    # (so we can re-enter after a clean exit) but otherwise bounded.
+    _buys_per_token: dict[str, list[float]] = field(default_factory=dict)
+    max_buys_per_token_window: int = 2
+    buys_per_token_window_sec: float = 86400.0
 
     def __post_init__(self) -> None:
         self.cash = self.nav_start
@@ -469,6 +484,19 @@ class PaperBroker:
 
         self.fills += 1
         ts = time.time()
+        # Stop-loss memo: any token that takes a stop_loss SELL goes into
+        # the recently-stopped set so other strategies refuse to re-enter
+        # it for ``stop_loss_blacklist_sec``. Same-token, same-condition
+        # too — see was_recently_stopped().
+        if strategy == "stop_loss" and side == "SELL":
+            self.recently_stopped[token_id] = ts
+            if condition_id:
+                self.recently_stopped[condition_id] = ts
+        # Per-token BUY counter for the hard fill-cap. Resets only via
+        # window expiry, NOT on stop-loss — a stopped token has bigger
+        # problems than the fill cap (it's blacklisted by recently_stopped).
+        if side == "BUY":
+            self._buys_per_token.setdefault(token_id, []).append(ts)
         # Compute pessimistic (worst-case) execution price for shadow ledger
         # using the Cont/Kukanov-style queue-loss + slippage model.
         pessimistic_price = price
@@ -657,6 +685,33 @@ class PaperBroker:
             "yes_size": yes_size,
             "no_size": no_size,
         }
+
+    def was_recently_stopped(self, token_id: str) -> bool:
+        """True if the token took a stop-loss within ``stop_loss_blacklist_sec``."""
+        ts = self.recently_stopped.get(token_id)
+        if ts is None:
+            return False
+        if time.time() - ts > self.stop_loss_blacklist_sec:
+            return False
+        return True
+
+    def buys_in_window(self, token_id: str) -> int:
+        """How many BUYs on this token are within the rolling fill-cap
+        window? Strategies should refuse new BUYs when this is
+        ``>= max_buys_per_token_window``."""
+        lst = self._buys_per_token.get(token_id)
+        if not lst:
+            return 0
+        now = time.time()
+        cutoff = now - self.buys_per_token_window_sec
+        # Trim in place so memory stays bounded.
+        kept = [t for t in lst if t >= cutoff]
+        if len(kept) != len(lst):
+            self._buys_per_token[token_id] = kept
+        return len(kept)
+
+    def is_token_buy_capped(self, token_id: str) -> bool:
+        return self.buys_in_window(token_id) >= self.max_buys_per_token_window
 
     async def snapshot_nav(self) -> None:
         if self.db is None:

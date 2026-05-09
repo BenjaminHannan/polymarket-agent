@@ -9,14 +9,25 @@ A research-grade prediction-market trading bot built incrementally over many ses
 ## Current state at a glance
 
 ```
-NAV (liquidation):      $10,005   (after ~120 paper fills)
-Realized P&L:           +$75
-Markets streaming:      ~500 (1,150+ books — both YES and NO tokens)
-GPU utilization:        ~34% memory (4.1 GB / 16.3 GB on RTX 5070 Ti)
-Background tasks:       18 supervised, all alive
-Model:                  LightGBM, 5-fold CV AUC 0.92, ECE_calibrated 0.0001
-Combiner:               7 categories, log-pool weights 0.7-1.0 stat / 0-0.3 mkt
+Markets streaming:      ~500 markets (~1,500 token books — both YES and NO)
+Background tasks:       ~25 supervised, all alive
+Model:                  LightGBM LambdaRank (day-grouped) + CPCV market-id-purged folds
+                        AUC 0.7739 on 10,212 resolved markets (held-out CV)
+Calibration:            Per-(category × horizon) cells with three-tier fallback —
+                        isotonic ≥80 / Venn-Abers ≥30 / Beta ≥15 / global isotonic
+Combiner:               Per-category log-pool, runtime-shrunk so p_market gets
+                        ≥60% weight regardless of trained weights
+LLM forecaster:         Phi-4-mini-instruct + hybrid BM25+dense retrieval +
+                        AIA debiasers + Karkare NegRisk consistency
+Risk gates active:      29+ — see "Risk gate stack" section
+GPU:                    ~5 GB used (RTX 5070 Ti, sm_120 Blackwell, cu128 nightly)
 ```
+
+The honest expected paper P&L over a session, given the literature-backed
+ceiling of a question-only ML model on Polymarket, is **±2% noise around
+zero**. Real positive ROI requires execution edge (passive maker fills) or
+NegRisk arbitrage, not directional model bets. See "Loss diagnostics &
+fixes" below for the empirical record.
 
 Dashboard: `http://127.0.0.1:8080`. Health: `/api/health`. Kill: `touch data/.STOP`.
 
@@ -466,8 +477,191 @@ Not an "improvement" per se — but the actual gating constraint. Without it, *a
 ### Out of scope / not pursued
 
 - **Kalshi cross-venue arbitrage** — the user explicitly excluded.
-- **Truth Social / Telegram / 4chan ingest** (in v2 blueprint) — too noisy at our scale; the existing 23 RSS sources + Bluesky + FRED/BLS already cover most signal.
+- **Truth Social / 4chan ingest** (in v2 blueprint) — too noisy at our scale; the existing 23 RSS sources + Bluesky + FRED/BLS already cover most signal.
 - **Vector-search retraining of embedder** — bge-large is already strong; fine-tuning would need labeled (question, news) pairs which we don't have.
+
+(Telegram ingest *was* added later — see "Session log: May 2026" below.)
+
+---
+
+## Session log: May 2026 — research-backed redesign
+
+This section captures three intense weeks of work after the initial build:
+literature surveys, ideas implemented, ideas deferred, and a candid record
+of three losing paper-trading sessions and what they revealed.
+
+### Major modules added
+
+| File | Purpose |
+|---|---|
+| [polyagent/queue_model.py](polyagent/queue_model.py) | Cont/Kukanov/Stoikov queue-aware fill probability + Polygon block (~2s) cancel-latency adverse-drift via Brownian σ√Δt; pessimistic_fill_price for shadow ledger. |
+| [polyagent/risk/latency_model.py](polyagent/risk/latency_model.py) | Empirical per-source latency tracker (`by_source` dict). p99 gate refuses trades on books staler than 5× our p99. |
+| [polyagent/risk/smart_money.py](polyagent/risk/smart_money.py) | Goldsky subgraph top-PnL maker-wallet registry. Refresh every 6h; tightens θ_min on sensitive categories when ≥50 wallets known. |
+| [polyagent/risk/wash_filter.py](polyagent/risk/wash_filter.py) | Dubach 2026 wash-trade hygiene: trade-without-book-change ratio per token; blacklist when share > 30% over 30+ samples. |
+| [polyagent/risk/live_ece.py](polyagent/risk/live_ece.py) | Live ECE drift monitor on rolling 30-day vs 365-day resolved markets; complements PSI. |
+| [polyagent/signals/combinatorial_arb.py](polyagent/signals/combinatorial_arb.py) | NegRisk sum-to-1 violation detector (IMDEA: $29M of arb on Polymarket Apr 2024–Apr 2025 came from this). Fallback monotonicity scanner for non-NegRisk events. |
+| [polyagent/signals/consistency_check.py](polyagent/signals/consistency_check.py) | Karkare NegRisk consistency: LLM forecasts each outcome, deviation from sum-to-1 downweights `llm_forecaster` expert. |
+| [polyagent/signals/local_edge.py](polyagent/signals/local_edge.py) | LocalEdgeClassifier — LLM pre-filter "does this market have non-English / insider info edge?" Cached forever. Routes capital to news_match + llm_forecaster on local-edge markets, downweights stat_lgbm. |
+| [polyagent/signals/message_market_match.py](polyagent/signals/message_market_match.py) | Per-news-event LLM matcher emitting `(market_id, confidence, direction, reason_short)` rows. Adapted from `takakhoo/Polymarket_Agent`. |
+| [polyagent/strategies/passive_poster.py](polyagent/strategies/passive_poster.py) | Maker-side paper-mode simulation. Posts inside the spread; queue-model-based per-cycle fill probability with cancel-latency penalty when realized vol is high. |
+| [polyagent/data/telegram.py](polyagent/data/telegram.py) | TDLib listener with hard read-only allowlist (asserted by guard test). Opt-in via `TELEGRAM_API_ID/HASH/PHONE/CHANNELS` env vars. |
+| [polyagent/data/telegram_planner.py](polyagent/data/telegram_planner.py) | Multilingual handle planner — LLM enumerates `(actors, countries, bridge languages, official/journalist/community handles)` per market. Static seed list (IDF, Pikud HaOref, Iran Intl, etc.) when LLM disabled. |
+| [polyagent/models/article_retriever.py](polyagent/models/article_retriever.py) | Hybrid BM25+dense retrieval with Reciprocal Rank Fusion for the LLM forecaster. Replaces pure-recency LIMIT 8. |
+| [polyagent/models/calibrator.py](polyagent/models/calibrator.py) | Three-tier calibrator: isotonic ≥80, **Venn-Abers ≥30** (Vovk/Petej; native conformal interval), Beta ≥15 (Kull et al. 2017), global isotonic fallback. `transform_with_interval` returns `(p_point, p_low, p_high)` triple consumed by conformal-Kelly. |
+| [polyagent/models/llm_forecaster.py](polyagent/models/llm_forecaster.py) | Phi-4-mini retrieval-augmented forecaster. Adds `_aia_debias()` (acquiescence + round-number unsticking from Karger et al. 2025). N-sample geometric-odds aggregation. `consistency_score()` for NegRisk groups. |
+| [polyagent/models/lgbm.py](polyagent/models/lgbm.py) | Default objective switched from `binary` to **`lambdarank`** with day-of-resolution as group key (Poh et al. 2021 ~3× Sharpe). CV switched from StratifiedKFold to **CPCV with market-id purging** (de Prado). |
+| [tests/test_data_clients_readonly.py](tests/test_data_clients_readonly.py) | Static guard tests: greps `polyagent/data/{telegram,alchemy,clob_history}.py` for forbidden mutating method names. 4/4 pass. |
+
+### Settings added
+~30 new env-var-overridable knobs. Highlights:
+- `combined_min_ask` (default $0.10) — longshot floor
+- `combined_max_ask` (default $0.85) — fade favorite floor
+- `combined_fee_buffer` (default 2pp) — half-spread buffer
+- `combined_kelly_mult` (default 0.075) — half-Kelly
+- `combined_max_per_trade_kelly` (default 0.025)
+- `passive_poster_per_post_notional` (default $12) — halved after diagnostic
+- `passive_poster_max_total_notional` (default $150) — halved
+- `enable_message_market_matcher`, `enable_passive_poster`, `enable_wash_filter`, `enable_combinatorial_arb`
+- `TELEGRAM_API_ID/HASH/PHONE/CHANNELS` (opt-in)
+- `ENABLE_LLM_FORECASTER` (default 0; flip to 1 to activate planner+classifier+matcher)
+
+### Ideas implemented from the literature
+
+From a 12-idea ranked research report:
+
+| # | Idea | Source | Status |
+|---|---|---|---|
+| 1 | DPO self-play fine-tune of Phi-4 | Turtel et al. 2025 (arXiv 2502.05253) | Deferred (6-12h GPU run) |
+| 2 | AIA acquiescence + round-number debiasers | Karger et al. 2025 (arXiv 2511.07678) | **Shipped** in `_aia_debias()` |
+| 3 | Venn-Abers replacing isotonic on thin cells | Manokhin 2025 / Vovk-Petej | **Shipped** as new tier in `CellCalibrator` |
+| 4 | ColBERTv2 late-interaction reranker | Stanford-FutureData | Deferred (storage/eng cost) |
+| 5 | Hybrid BM25+dense+RRF retrieval | 2025 RAG benchmarks | **Shipped** in `article_retriever.py` |
+| 6 | Multi-level OFI (deep-tick) | Kolm/Turiel/Westray 2023 | Already had basic OFI in `orderbook.py` |
+| 7 | TabPFN v2.5 as 5th expert | Hollmann et al. Nature 2025 | Deferred (training-pipeline change) |
+| 8 | Mantic-style RL fine-tune | Thinking Machines Nov 2025 | Deferred (GPU cost) |
+| 9 | Conformal lower-bound Kelly sizing | Vovk 2025 / ICLR | **Shipped** — Predictor exposes `calibrated_low/high`; trader sizes off lower bound |
+| 10 | NegRisk LLM-extracted dependencies | Saguillo et al. AFT 2025 | Already had basic NegRisk arb scanner |
+| 11 | Chronos-2 / Moirai-MoE for price trajectory | Various 2025 | Deferred (likely OOD on binary CLOB) |
+| 12 | FinCast token-level sparse-MoE gating | Liang et al. 2025 | Deferred (architectural lift) |
+
+### Ideas implemented from `takakhoo/Polymarket_Agent` survey
+
+| # | Idea | Status |
+|---|---|---|
+| 1 | Multilingual Telegram-handle planner | **Shipped** (`telegram_planner.py`) |
+| 2 | Local-edge classifier as LLM pre-filter | **Shipped** (`local_edge.py`); tilts log-pool weights |
+| 3 | Per-message → market matcher with `(confidence, direction, reason_short)` | **Shipped** (`message_market_match.py`) |
+| 4 | Read-only safety guard test for data clients | **Shipped** (`tests/test_data_clients_readonly.py`) |
+| 5 | TDLib similar-channel graph walk | Skipped (operational complexity) |
+| 6 | Handpicked-markets workflow | Skipped (manual, doesn't fit automated bot) |
+
+### Loss diagnostics & fixes
+
+Three losing sessions, each revealed a different layer of the same
+fundamental issue: **a question-only ML model cannot beat an efficient
+prediction market on direction** (Della Vedova SSRN 6191618, Akey et al.
+SSRN 6443103, Yang Augusta 2026). The market's Brier on resolved markets
+is ~0.05–0.10; ours is ~0.13–0.18 — **2–3× worse**. The gap masquerades
+as "edge" until execution costs eat it.
+
+#### Session 1 — −3.7% (longshot disaster)
+
+Empirical:
+- 31% of `combined_signal` events on markets with `p_market < 0.05`
+- Model claimed **+24.8pp average edge** on every single one (impossible)
+- 28% of all BUYs were on tokens under $0.10
+- 22 stop-losses fired on cheap longshots dropping 40% (which is just 1-tick noise on $0.05 books)
+- Slippage burn: 22% of all notional deployed
+
+Diagnosis: question-only LightGBM regresses every prediction toward the training base rate (23.4%), so anywhere `p_market` is far from 23.4% the model "disagrees". That gap isn't edge — it's the model's residual error. Whelan (2024) Economica + GW Kalshi 2026: sub-10¢ contracts return −60% on average.
+
+Fixes shipped:
+- **Longshot floor** `combined_min_ask = $0.10` — refuse trades below it
+- **Edge-sanity cap** `|edge| ≤ min(p_mkt, 1−p_mkt)` — bigger gap than the market's prior is statistically impossible from an AUC=0.77 model
+- **Market-prior shrinkage in log-pool** — runtime enforces `p_market` weight ≥ 60% regardless of trained weights (Akey 2026's "shrink toward market" recipe)
+- **Half-Kelly + 2pp fee buffer + tighter daily/per-trade caps**
+- **Longshot-aware stop-loss**: 70% drop threshold for tokens < $0.10 (avoids tripping on 1¢ noise)
+- **Pessimistic-NAV deployment gate** at 100 fills with 5% slippage-burn block
+
+#### Session 2 — −2% (mid-priced averaging-down)
+
+After Session 1's fixes the longshot pathology vanished, but the bot still lost 2% with 49 fills + 7 stops. Audit:
+
+- `trade_hunter.py` was bypassing the new market-prior shrinkage (used raw trained weights)
+- Same token bought 4× at the same price as it fell, then stop-lossed, then **bought back** within 60s ("falling knife")
+- 5pp/15% averaging-down threshold too loose
+
+Fixes shipped:
+- **Market-prior shrinkage applied in `trade_hunter.py` too** (mirror of `combined.py`)
+- **Stop-loss re-entry blacklist (24h)** — `broker.recently_stopped[token_id]` checked before every BUY
+- **Averaging-down guard tightened** to 3% relative drop / 2pp absolute
+- SQLite `busy_timeout` 10s → 30s, retry budget 1.4s → 12s (was producing supervisor-restart noise)
+
+#### Session 3 — −5% (passive_poster cycling)
+
+After Session 2's fixes, the longshot AND averaging-down patterns were both gone. New vector emerged: `passive_poster` cycling fills on the same token because the price didn't actually drop between fills.
+
+- One token: **24 passive_poster fills totaling $170**
+- Another: 28 fills cycling between combined_trader and passive_poster at $0.30
+- The averaging-down guard checks `mid < avg_cost × 0.97` — when price stays flat between fills, the guard doesn't engage; we just keep piling on
+- `passive_poster` had no per-token notional cap — only a global $300 cap
+
+Fixes shipped:
+- **Hard broker-level fill cap**: `max_buys_per_token_window = 2` per 24h, applies to every strategy
+- `passive_poster` sizing halved: `per_post_notional $25→$12`, `max_total_notional $300→$150`, `max_concurrent 8→5`
+- Fill counts tracked per-token in `broker._buys_per_token` with rolling-window expiry
+
+### Risk gate stack (current, ordered)
+
+Every BUY passes through this gate sequence. Order matters: cheaper checks first.
+
+1. Kill switch (`data/.STOP`)
+2. Pessimistic-NAV deployment gate (≥5% slippage burn / starting NAV over last 100 fills)
+3. **Per-token fill cap** (broker-level, ≤2 BUYs / 24h / token)
+4. Per-strategy daily loss kill ($250)
+5. Volume24h floor ($1,000)
+6. Edge-sanity cap (`|edge| ≤ min(p_mkt, 1−p_mkt)`)
+7. Fee-adjusted edge ≥ θ_min × (1 + 10 × drawdown)
+8. Per-market cooldown (600s)
+9. Per-token cooldown (120s)
+10. Adverse-selection blacklist
+11. **Stop-loss re-entry blacklist (24h)**
+12. **Averaging-down guard (3% drop / 2pp absolute)**
+13. Smart-money tighten on geopolitical categories (×1.5 θ if ≥50 known wallets)
+14. Wash-trade hygiene blacklist
+15. Stale-quote skip (5 min)
+16. **Latency p99 gate** (refuse if book age > 5× p99 of WSS source)
+17. Best-ask in `[combined_min_ask=0.10, combined_max_ask=0.85]`
+18. Spread ≤ 5pp
+19. Min ask depth ≥ $25
+20. Full Kelly > 0
+21. Auto-throttler multiplier > 0
+22. Drawdown-conditioned Kelly scale
+23. Bandit-Thompson per-category multiplier
+24. Per-trade Kelly cap (2.5% NAV) + notional cap ($30)
+25. Per-market notional cap ($100)
+26. Per-category concentration (≤30% NAV)
+27. Daily notional cap ($500)
+28. Final notional ≥ $1
+29. Final size ≥ ε
+
+Plus passive_poster has its own ~12 gates (eligibility, post-price sanity, smart-money tilt, recently-stopped block, averaging-down, fill-count cap, max_concurrent, max_total_notional, etc.).
+
+### Honest performance ceiling
+
+Per the research, a question-only model on Polymarket has a structural
+ceiling near zero ROI even with all gates applied. Realistic targets:
+
+- **Brier**: ~0.09–0.11 with B+C+D+9 fixes from the literature report
+- **ROI**: roughly flat, ±2% per session is normal noise
+- **Where positive ROI lives**: maker-side spread capture (Yang 2026: $121/market making vs $63 taking) and NegRisk arbitrage (IMDEA: $29M/$40M of all Polymarket arb 2024–2025) — neither of which is a directional model bet
+
+The bot is now structurally honest about this — it sizes off conformal
+lower bounds, blocks every documented loss vector, and **doesn't pretend
+to have edge it can't have**. Improvements from here come from richer
+data (the Telegram listener for non-English geopolitical wires, the
+DPO-fine-tuned LLM forecaster) or from execution edge that requires
+real-money infrastructure.
 
 ---
 

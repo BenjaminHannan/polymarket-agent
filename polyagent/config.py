@@ -134,9 +134,13 @@ class Settings:
     enable_passive_poster: bool = os.getenv("ENABLE_PASSIVE_POSTER", "1") == "1"
     passive_poster_poll_sec: float = float(os.getenv("PASSIVE_POSTER_POLL_SEC", "20"))
     passive_poster_min_edge: float = float(os.getenv("PASSIVE_POSTER_MIN_EDGE", "0.04"))
-    passive_poster_max_concurrent: int = int(os.getenv("PASSIVE_POSTER_MAX_CONCURRENT", "8"))
-    passive_poster_per_post_notional: float = float(os.getenv("PASSIVE_POSTER_PER_POST_NOTIONAL", "25"))
-    passive_poster_max_total_notional: float = float(os.getenv("PASSIVE_POSTER_MAX_TOTAL_NOTIONAL", "300"))
+    passive_poster_max_concurrent: int = int(os.getenv("PASSIVE_POSTER_MAX_CONCURRENT", "5"))
+    # Halved per-post + halved total (was 25/300). Diagnostic of a -5%
+    # session showed passive_poster ran $638 of buys on tokens that
+    # later stop-lossed; the hard per-token cap catches most of that
+    # but tighter sizing limits damage when it doesn't.
+    passive_poster_per_post_notional: float = float(os.getenv("PASSIVE_POSTER_PER_POST_NOTIONAL", "12"))
+    passive_poster_max_total_notional: float = float(os.getenv("PASSIVE_POSTER_MAX_TOTAL_NOTIONAL", "150"))
     passive_poster_aggression: float = float(os.getenv("PASSIVE_POSTER_AGGRESSION", "0.4"))
     passive_poster_ttl_sec: float = float(os.getenv("PASSIVE_POSTER_TTL_SEC", "180"))
     passive_poster_max_spread: float = float(os.getenv("PASSIVE_POSTER_MAX_SPREAD", "0.10"))

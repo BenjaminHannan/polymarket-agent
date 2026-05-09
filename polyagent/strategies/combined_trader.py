@@ -232,6 +232,52 @@ class CombinedTrader:
             log.info("combined_trade_skip_adverse", token_id=token_id[:14])
             return
 
+        # Stop-loss re-entry block: refuse to re-buy a token (or even a
+        # condition) that took a stop-loss in the last 24h. The model's
+        # "edge" claim was wrong once; it's still wrong.
+        if self.broker.was_recently_stopped(token_id) or (
+            market.condition_id and self.broker.was_recently_stopped(market.condition_id)
+        ):
+            log.info("combined_trade_skip_recently_stopped", token_id=token_id[:14])
+            return
+        # Hard per-token fill cap (broker-level): no strategy may exceed
+        # ``broker.max_buys_per_token_window`` BUYs on the same token in
+        # the rolling window. Stops the cycling-fill pattern where a
+        # single token accumulates 20+ fills as the model emits the same
+        # edge claim repeatedly.
+        if self.broker.is_token_buy_capped(token_id):
+            log.info(
+                "combined_trade_skip_token_buy_capped",
+                token_id=token_id[:14],
+                count=self.broker.buys_in_window(token_id),
+            )
+            return
+
+        # Averaging-down guard: if we already hold this token AND the
+        # current best ask is below our entry by ANY material amount,
+        # do NOT add to the position. The model has been wrong on this
+        # one and we should stop catching the falling knife. Threshold
+        # is 3% relative drop OR 2pp absolute (whichever is smaller) —
+        # tightened from 15%/5pp because the previous session showed
+        # 4 fills at the same price as a token fell to a stop-loss.
+        existing_pos = self.broker.positions.get(token_id)
+        if existing_pos and existing_pos.size > 0 and existing_pos.avg_cost > 0:
+            book_ask = self.book_store.books.get(token_id)
+            ba_now = book_ask.best_ask() if book_ask is not None else None
+            if ba_now is not None:
+                ask_now = ba_now[0]
+                drop_abs = existing_pos.avg_cost - ask_now
+                drop_rel = drop_abs / max(existing_pos.avg_cost, 1e-6)
+                if drop_abs >= 0.02 or drop_rel >= 0.03:
+                    log.info(
+                        "combined_trade_skip_averaging_down",
+                        token_id=token_id[:14],
+                        avg_cost=round(existing_pos.avg_cost, 4),
+                        ask_now=round(ask_now, 4),
+                        drop_pct=round(drop_rel * 100, 2),
+                    )
+                    return
+
         # Wash-trade hygiene (Dubach 2026): skip tokens whose recent trade
         # stream shows >max_wash_share of trades with no concurrent book
         # change.
