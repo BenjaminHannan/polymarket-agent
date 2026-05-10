@@ -5,8 +5,28 @@ Single-process aiohttp server. Reads from the live broker for cash/positions
 Serves a self-contained HTML page at / and JSON endpoints under /api.
 
 Run as a supervised task in main; default port 8080. Open
-http://localhost:8080 to see portfolio value + asset breakdowns + recent
-fills + NAV trajectory + per-strategy P&L.
+http://localhost:8080 to see:
+
+  - sticky header with cert-gate status (ON/OFF + allowed categories)
+  - headline cards: NAV, cash, positions value, realized P&L
+  - NAV history chart (hover for tooltip, time axis, baseline reference)
+  - strategy-certificate panel (every cert with enabled/disabled state, DSR,
+    edge claim, sign-test, n_holdout)
+  - by-category rollup: open positions, fills 24h/total, win rate, P&L,
+    with certified categories highlighted
+  - per-strategy P&L
+  - open positions, recent settlements, recent fills (with category pills)
+
+JSON endpoints:
+  /api/summary        broker state + per-strategy P&L
+  /api/positions      open positions with mark + unrealized
+  /api/fills          recent fills (with category)
+  /api/nav-history    NAV time series
+  /api/resolutions    recent settlements
+  /api/health         liveness probe
+  /api/pessimistic    pessimistic execution-cost ledger
+  /api/certificates   strategy_certificates rows + gate status
+  /api/by-category    open + historical activity rolled up by category
 """
 
 from __future__ import annotations
@@ -179,6 +199,18 @@ class Dashboard:
                 """,
                 (limit,),
             ).fetchall()
+            # Pull category fallback for fills against settled markets that
+            # are no longer in the live scan.
+            cids = {r["condition_id"] for r in rows}
+            hist_cats: dict[str, str] = {}
+            if cids:
+                placeholders = ",".join("?" * len(cids))
+                cat_rows = conn.execute(
+                    f"SELECT condition_id, category FROM signal_outcomes "
+                    f"WHERE category IS NOT NULL AND condition_id IN ({placeholders})",
+                    list(cids),
+                ).fetchall()
+                hist_cats = {r["condition_id"]: r["category"] for r in cat_rows}
             conn.close()
         except Exception as e:
             log.warning("dashboard_fills_query_error", err=str(e))
@@ -192,6 +224,8 @@ class Dashboard:
                     yes_no = "YES"
                 elif r["token_id"] == market.no_token_id:
                     yes_no = "NO"
+            cat = (market.category if market and market.category else
+                   hist_cats.get(r["condition_id"]))
             out.append(
                 {
                     "ts": r["ts"],
@@ -202,11 +236,171 @@ class Dashboard:
                     "side": r["side"],
                     "yes_no": yes_no,
                     "question": market.question if market else r["condition_id"][:16] + "..",
+                    "category": cat,
                     "price": r["price"],
                     "size": r["size"],
                     "notional": r["notional"],
                 }
             )
+        return out
+
+    def _certificates(self) -> dict[str, Any]:
+        """Return active and superseded strategy certificates + gate status."""
+        try:
+            conn = _read_only_conn(self.db_path)
+            rows = conn.execute(
+                """SELECT name, enabled, dsr_holdout, n_holdout, issued_ts, detail
+                   FROM strategy_certificates ORDER BY issued_ts DESC"""
+            ).fetchall()
+            conn.close()
+        except Exception as e:
+            log.warning("dashboard_certs_query_error", err=str(e))
+            return {"certs": [], "gate_enabled": False, "allowed_categories": []}
+        certs: list[dict[str, Any]] = []
+        allowed: set[str] = set()
+        for r in rows:
+            try:
+                d = json.loads(r["detail"] or "{}")
+            except json.JSONDecodeError:
+                d = {}
+            cat = d.get("category")
+            if r["enabled"] and isinstance(cat, str) and cat:
+                allowed.add(cat)
+            certs.append(
+                {
+                    "name": r["name"],
+                    "enabled": bool(r["enabled"]),
+                    "category": cat,
+                    "dsr": r["dsr_holdout"],
+                    "n_holdout": r["n_holdout"],
+                    "issued_ts": r["issued_ts"],
+                    "issued_iso": time.strftime("%Y-%m-%d", time.gmtime(r["issued_ts"])),
+                    "reason": d.get("reason"),
+                    "fold_edge_mean": d.get("fold_edge_mean"),
+                    "fold_pos_count": d.get("fold_pos_count"),
+                    "fold_count": d.get("fold_count"),
+                    "sign_test_p_value": d.get("sign_test_p_value"),
+                    "market_baseline_logloss": d.get("market_baseline_logloss"),
+                    "combiner_in_sample_logloss": d.get("combiner_in_sample_logloss"),
+                }
+            )
+        return {
+            "certs": certs,
+            "gate_enabled": bool(getattr(settings, "enable_certificate_gate", False)),
+            "allowed_categories": sorted(allowed),
+        }
+
+    def _by_category(self) -> list[dict[str, Any]]:
+        """Aggregate live positions + fills + realized P&L by market category.
+
+        Categorisation order: live market lookup (current scan) → resolved
+        market category from signal_outcomes (historical) → "uncategorized".
+        """
+        agg: dict[str, dict[str, float]] = {}
+
+        def _bucket(cat: str | None) -> dict[str, float]:
+            key = cat or "uncategorized"
+            return agg.setdefault(
+                key,
+                {
+                    "category": key,
+                    "open_positions": 0,
+                    "open_value_bid": 0.0,
+                    "open_unrealized_bid": 0.0,
+                    "fills_24h": 0,
+                    "fills_total": 0,
+                    "notional_total": 0.0,
+                    "realized_pnl": 0.0,
+                    "resolved": 0,
+                    "wins": 0,
+                },
+            )
+
+        # Build a condition_id -> category lookup from signal_outcomes for
+        # historical fills whose markets are no longer in the live scan.
+        try:
+            conn = _read_only_conn(self.db_path)
+            cat_rows = conn.execute(
+                "SELECT condition_id, category FROM signal_outcomes "
+                "WHERE category IS NOT NULL"
+            ).fetchall()
+            historical_cats = {r["condition_id"]: r["category"] for r in cat_rows}
+        except Exception as e:
+            log.warning("dashboard_bycat_lookup_error", err=str(e))
+            historical_cats = {}
+
+        def _resolve_cat(token_id: str, condition_id: str | None) -> str | None:
+            m = self.markets_by_token.get(token_id)
+            if m and m.category:
+                return m.category
+            if condition_id and condition_id in historical_cats:
+                return historical_cats[condition_id]
+            return None
+
+        for p in self.broker.positions.values():
+            if p.size <= 0:
+                continue
+            market = self.markets_by_token.get(p.token_id)
+            cid = market.condition_id if market else None
+            cat = _resolve_cat(p.token_id, cid)
+            book = self.book_store.books.get(p.token_id)
+            bid = book.best_bid() if book else None
+            mark = bid[0] if bid else p.avg_cost
+            b = _bucket(cat)
+            b["open_positions"] += 1
+            b["open_value_bid"] += p.size * mark
+            b["open_unrealized_bid"] += (mark - p.avg_cost) * p.size
+
+        # All-time fills + realized P&L by category
+        try:
+            conn = _read_only_conn(self.db_path)
+            now = time.time()
+            f_rows = conn.execute(
+                "SELECT ts, condition_id, token_id, notional FROM fills"
+            ).fetchall()
+            r_rows = conn.execute(
+                """SELECT f.condition_id, f.token_id, f.price, f.size,
+                          r.yes_won, r.yes_token_id, r.no_token_id
+                   FROM fills f INNER JOIN resolutions r
+                   ON f.condition_id = r.condition_id"""
+            ).fetchall()
+            conn.close()
+        except Exception as e:
+            log.warning("dashboard_bycat_query_error", err=str(e))
+            return list(agg.values())
+
+        for r in f_rows:
+            cat = _resolve_cat(r["token_id"], r["condition_id"])
+            b = _bucket(cat)
+            b["fills_total"] += 1
+            b["notional_total"] += float(r["notional"] or 0)
+            if now - r["ts"] < 86400:
+                b["fills_24h"] += 1
+
+        for r in r_rows:
+            cat = _resolve_cat(r["token_id"], r["condition_id"])
+            b = _bucket(cat)
+            b["resolved"] += 1
+            won = (r["token_id"] == r["yes_token_id"] and r["yes_won"]) or (
+                r["token_id"] == r["no_token_id"] and not r["yes_won"]
+            )
+            if won:
+                b["wins"] += 1
+            payout = 1.0 if won else 0.0
+            b["realized_pnl"] += (payout - r["price"]) * r["size"]
+
+        out = list(agg.values())
+        for b in out:
+            b["open_value_bid"] = round(b["open_value_bid"], 2)
+            b["open_unrealized_bid"] = round(b["open_unrealized_bid"], 2)
+            b["notional_total"] = round(b["notional_total"], 2)
+            b["realized_pnl"] = round(b["realized_pnl"], 2)
+            b["win_rate"] = (b["wins"] / b["resolved"]) if b["resolved"] else None
+        out.sort(
+            key=lambda x: (
+                -(x["open_value_bid"] or 0) - abs(x["realized_pnl"] or 0) * 0.5
+            )
+        )
         return out
 
     def _nav_history(self, limit: int = 500) -> list[dict[str, Any]]:
@@ -286,6 +480,12 @@ class Dashboard:
     async def api_resolutions(self, request: web.Request) -> web.Response:
         limit = int(request.query.get("limit", "25"))
         return web.json_response(self._recent_resolutions(limit))
+
+    async def api_certificates(self, request: web.Request) -> web.Response:
+        return web.json_response(self._certificates())
+
+    async def api_by_category(self, request: web.Request) -> web.Response:
+        return web.json_response(self._by_category())
 
     async def api_pessimistic_nav(self, request: web.Request) -> web.Response:
         """Compute realized P&L using shadow ledger pessimistic prices.
@@ -369,6 +569,8 @@ class Dashboard:
         app.router.add_get("/api/resolutions", self.api_resolutions)
         app.router.add_get("/api/health", self.api_health)
         app.router.add_get("/api/pessimistic", self.api_pessimistic_nav)
+        app.router.add_get("/api/certificates", self.api_certificates)
+        app.router.add_get("/api/by-category", self.api_by_category)
         runner = web.AppRunner(app)
         await runner.setup()
         site = web.TCPSite(runner, "127.0.0.1", self.port)
@@ -385,111 +587,211 @@ DASHBOARD_HTML = """<!doctype html>
 <title>polyagent — paper portfolio</title>
 <style>
   * { box-sizing: border-box; }
+  :root {
+    --bg: #0d1117;
+    --panel: #161b22;
+    --panel-2: #1c2128;
+    --border: #21262d;
+    --border-2: #30363d;
+    --text: #e6edf3;
+    --muted: #8b949e;
+    --accent: #58a6ff;
+    --pos: #3fb950;
+    --neg: #f85149;
+    --warn: #d29922;
+  }
   body {
     margin: 0;
-    font: 14px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-    background: #0d1117;
-    color: #e6edf3;
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--text);
   }
   header {
-    padding: 24px 32px 8px;
-    border-bottom: 1px solid #21262d;
+    position: sticky; top: 0; z-index: 10;
+    padding: 14px 32px;
+    background: rgba(13,17,23,0.85);
+    backdrop-filter: blur(12px);
+    border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
   }
-  header h1 { margin: 0 0 4px; font-size: 18px; font-weight: 600; }
-  header .subtle { color: #8b949e; font-size: 12px; }
-  main { padding: 24px 32px; }
+  header h1 {
+    margin: 0; font-size: 16px; font-weight: 600;
+    display: flex; align-items: center; gap: 8px;
+  }
+  header h1 .dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--pos); box-shadow: 0 0 8px var(--pos);
+    animation: pulse 2s infinite ease-in-out;
+  }
+  @keyframes pulse { 50% { opacity: 0.4; } }
+  header .pill-gate {
+    display: inline-flex; align-items: center; gap: 6px;
+    font-size: 11px; padding: 3px 10px; border-radius: 12px;
+    background: #0d2f1d; color: #7ee2a8; border: 1px solid #1f6e35;
+  }
+  header .pill-gate.off {
+    background: #2d2018; color: #f0a86a; border-color: #6e4a1f;
+  }
+  header .spacer { flex: 1; }
+  header .last-update { color: var(--muted); font-size: 12px; }
+  header button.refresh {
+    background: none; border: 1px solid var(--border-2);
+    color: var(--text); padding: 5px 12px; border-radius: 6px;
+    cursor: pointer; font: inherit;
+  }
+  header button.refresh:hover { background: var(--panel-2); }
+  main { padding: 24px 32px; max-width: 1600px; margin: 0 auto; }
   .grid {
     display: grid;
-    grid-template-columns: repeat(4, 1fr);
-    gap: 16px;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 14px;
     margin-bottom: 24px;
   }
   .card {
-    background: #161b22;
-    border: 1px solid #21262d;
-    border-radius: 8px;
-    padding: 16px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px 18px;
+    transition: border-color 0.15s;
   }
+  .card:hover { border-color: var(--border-2); }
   .card .label {
     font-size: 11px;
     text-transform: uppercase;
-    letter-spacing: 0.05em;
-    color: #8b949e;
-    margin-bottom: 8px;
+    letter-spacing: 0.06em;
+    color: var(--muted);
+    margin-bottom: 6px;
+    display: flex; align-items: center; justify-content: space-between;
   }
   .card .value {
-    font-size: 22px;
+    font-size: 26px;
     font-weight: 600;
     font-variant-numeric: tabular-nums;
+    line-height: 1.1;
   }
   .card .delta {
-    margin-top: 4px;
+    margin-top: 6px;
     font-size: 12px;
     font-variant-numeric: tabular-nums;
   }
-  .pos { color: #3fb950; }
-  .neg { color: #f85149; }
-  .neu { color: #8b949e; }
-  section { margin-bottom: 32px; }
+  .pos { color: var(--pos); }
+  .neg { color: var(--neg); }
+  .neu { color: var(--muted); }
+  .warn { color: var(--warn); }
+  section { margin-bottom: 28px; }
   section h2 {
-    font-size: 14px;
+    font-size: 12px;
     font-weight: 600;
     text-transform: uppercase;
-    letter-spacing: 0.05em;
-    color: #8b949e;
-    margin: 0 0 12px;
+    letter-spacing: 0.08em;
+    color: var(--muted);
+    margin: 0 0 10px;
+    display: flex; align-items: center; gap: 8px;
+  }
+  section h2 .count {
+    font-size: 11px; color: var(--muted);
+    background: var(--panel); padding: 1px 8px; border-radius: 10px;
+    border: 1px solid var(--border); text-transform: none;
+    letter-spacing: 0;
   }
   table {
     width: 100%;
-    border-collapse: collapse;
-    background: #161b22;
-    border: 1px solid #21262d;
-    border-radius: 8px;
+    border-collapse: separate;
+    border-spacing: 0;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
     overflow: hidden;
   }
   th, td {
-    padding: 8px 12px;
+    padding: 9px 14px;
     text-align: left;
     font-variant-numeric: tabular-nums;
-    border-bottom: 1px solid #21262d;
+    border-bottom: 1px solid var(--border);
   }
-  th { background: #0d1117; color: #8b949e; font-weight: 500; font-size: 12px; }
-  td.num { text-align: right; }
+  th {
+    background: rgba(13,17,23,0.6);
+    color: var(--muted);
+    font-weight: 500;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    position: sticky; top: 53px; /* below sticky header */
+  }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
   tbody tr:last-child td { border-bottom: none; }
-  tbody tr:hover { background: #1c2128; }
+  tbody tr:hover { background: var(--panel-2); }
+  tr.certified { background: rgba(63,185,80,0.04); }
   .pill {
     display: inline-block;
-    padding: 1px 8px;
-    border-radius: 10px;
+    padding: 2px 9px;
+    border-radius: 11px;
     font-size: 11px;
     font-weight: 500;
+    line-height: 1.4;
   }
-  .pill-yes { background: #1f6e35; color: #b5f6c5; }
-  .pill-no  { background: #6e1f1f; color: #f6b5b5; }
-  .pill-cat { background: #1f3e6e; color: #b5d0f6; }
-  .small { font-size: 12px; color: #8b949e; }
-  .refresh {
-    background: none;
-    border: 1px solid #30363d;
-    color: #c9d1d9;
-    padding: 4px 12px;
+  .pill-yes { background: #133021; color: #7ee2a8; }
+  .pill-no  { background: #301414; color: #f6b5b5; }
+  .pill-cat { background: #1f2d44; color: #9bbcdc; }
+  .pill-cat.allowed { background: #133021; color: #7ee2a8; }
+  .pill-on  { background: #133021; color: #7ee2a8; }
+  .pill-off { background: #2d2018; color: #f0a86a; }
+  .small { font-size: 12px; color: var(--muted); }
+  .mono { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
+  .cert-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+    gap: 12px;
+  }
+  .cert-card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 14px 16px;
+    border-left: 3px solid var(--border-2);
+  }
+  .cert-card.enabled { border-left-color: var(--pos); }
+  .cert-card.disabled { border-left-color: var(--neg); opacity: 0.7; }
+  .cert-card .name {
+    font-weight: 600; font-size: 13px;
+    display: flex; justify-content: space-between; align-items: center;
+    gap: 8px;
+  }
+  .cert-card .row {
+    margin-top: 6px; display: flex; justify-content: space-between;
+    font-size: 12px; color: var(--muted);
+  }
+  .cert-card .row .v { color: var(--text); font-variant-numeric: tabular-nums; }
+  .cert-card .reason { font-size: 11px; color: var(--muted); margin-top: 8px; line-height: 1.4; }
+  #nav-chart-wrap {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px;
+  }
+  #nav-chart { width: 100%; height: 280px; display: block; }
+  #nav-tip {
+    position: absolute;
+    pointer-events: none;
+    background: var(--panel-2);
+    border: 1px solid var(--border-2);
     border-radius: 6px;
-    cursor: pointer;
-    font: inherit;
+    padding: 6px 10px;
+    font-size: 12px;
+    font-variant-numeric: tabular-nums;
+    transform: translate(-50%, -120%);
+    display: none;
+    white-space: nowrap;
   }
-  .refresh:hover { background: #21262d; }
-  #nav-chart { width: 100%; height: 220px; }
 </style>
 </head>
 <body>
 <header>
-  <h1>polyagent — paper portfolio</h1>
-  <div class="subtle">
-    Live paper-trading dashboard ·
-    <span id="last-update">loading…</span>
-    <button class="refresh" onclick="loadAll()">refresh</button>
-    <span class="small" id="auto-info">auto-refreshes every 10s</span>
-  </div>
+  <h1><span class="dot"></span>polyagent <span class="small" style="font-weight:400">paper</span></h1>
+  <span class="pill-gate" id="gate-pill">cert gate: …</span>
+  <span class="spacer"></span>
+  <span class="last-update" id="last-update">loading…</span>
+  <button class="refresh" onclick="loadAll()">refresh</button>
 </header>
 <main>
   <div class="grid">
@@ -516,8 +818,37 @@ DASHBOARD_HTML = """<!doctype html>
   </div>
 
   <section>
-    <h2>NAV history (mid)</h2>
-    <canvas id="nav-chart"></canvas>
+    <h2>NAV history (mid) <span class="small" id="nav-range">—</span></h2>
+    <div id="nav-chart-wrap" style="position:relative">
+      <canvas id="nav-chart"></canvas>
+      <div id="nav-tip"></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>strategy certificates <span class="count" id="cert-count">0</span></h2>
+    <div class="cert-grid" id="certificates"><div class="small">loading…</div></div>
+  </section>
+
+  <section>
+    <h2>by category</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>category</th>
+          <th>cert</th>
+          <th class="num">open</th>
+          <th class="num">value@bid</th>
+          <th class="num">unrealized</th>
+          <th class="num">fills (24h / total)</th>
+          <th class="num">notional</th>
+          <th class="num">resolved</th>
+          <th class="num">win rate</th>
+          <th class="num">realized P&amp;L</th>
+        </tr>
+      </thead>
+      <tbody id="by-category"><tr><td colspan="10" class="small">loading…</td></tr></tbody>
+    </table>
   </section>
 
   <section>
@@ -566,12 +897,13 @@ DASHBOARD_HTML = """<!doctype html>
   </section>
 
   <section>
-    <h2>recent fills</h2>
+    <h2>recent fills <span class="count" id="fills-count-badge">0</span></h2>
     <table>
       <thead>
         <tr>
           <th>time</th>
           <th>strategy</th>
+          <th>cat</th>
           <th>side</th>
           <th>question</th>
           <th class="num">price</th>
@@ -579,7 +911,7 @@ DASHBOARD_HTML = """<!doctype html>
           <th class="num">notional</th>
         </tr>
       </thead>
-      <tbody id="fills"><tr><td colspan="7" class="small">loading…</td></tr></tbody>
+      <tbody id="fills"><tr><td colspan="8" class="small">loading…</td></tr></tbody>
     </table>
   </section>
 </main>
@@ -660,24 +992,106 @@ function renderPositions(rows) {
   }
 }
 
+let _allowedCategories = new Set();
+
 function renderFills(rows) {
   const tbody = document.getElementById('fills');
+  document.getElementById('fills-count-badge').textContent = rows.length;
   tbody.innerHTML = '';
   if (!rows.length) {
-    tbody.innerHTML = '<tr><td colspan="7" class="small">no fills yet</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="8" class="small">no fills yet</td></tr>';
     return;
   }
   for (const f of rows) {
     const tr = document.createElement('tr');
     const yn = f.yes_no === 'YES' ? 'pill-yes' : f.yes_no === 'NO' ? 'pill-no' : 'pill-cat';
+    const catCls = f.category && _allowedCategories.has(f.category) ? 'pill pill-cat allowed' : 'pill pill-cat';
+    const catCell = f.category ? `<span class="${catCls}">${f.category}</span>` : '<span class="small">—</span>';
     tr.innerHTML = `
-      <td class="small">${f.ts_iso}</td>
+      <td class="small mono">${f.ts_iso.slice(11)}</td>
       <td>${f.strategy}</td>
+      <td>${catCell}</td>
       <td><span class="pill ${yn}">${f.side} ${f.yes_no}</span></td>
-      <td>${(f.question || '').slice(0,80)}</td>
+      <td>${(f.question || '').slice(0,90)}</td>
       <td class="num">${f.price.toFixed(4)}</td>
       <td class="num">${f.size.toLocaleString(undefined,{maximumFractionDigits:1})}</td>
       <td class="num">${fmtUsd(f.notional)}</td>
+    `;
+    tbody.appendChild(tr);
+  }
+}
+
+function renderCertificates(data) {
+  const grid = document.getElementById('certificates');
+  const certs = data.certs || [];
+  document.getElementById('cert-count').textContent = certs.length + ' total · ' +
+    certs.filter(c => c.enabled).length + ' enabled';
+
+  // Header gate pill
+  const gatePill = document.getElementById('gate-pill');
+  if (data.gate_enabled) {
+    gatePill.textContent = 'cert gate ON · ' + (data.allowed_categories.join(', ') || 'no categories');
+    gatePill.className = 'pill-gate';
+  } else {
+    gatePill.textContent = 'cert gate OFF';
+    gatePill.className = 'pill-gate off';
+  }
+  _allowedCategories = new Set(data.allowed_categories || []);
+
+  grid.innerHTML = '';
+  if (!certs.length) {
+    grid.innerHTML = '<div class="small">no certificates issued yet</div>';
+    return;
+  }
+  for (const c of certs) {
+    const div = document.createElement('div');
+    div.className = 'cert-card ' + (c.enabled ? 'enabled' : 'disabled');
+    const edgeStr = c.fold_edge_mean != null ?
+      (c.fold_edge_mean >= 0 ? '+' : '') + c.fold_edge_mean.toFixed(4) : '—';
+    const dsrStr = c.dsr != null ? c.dsr.toFixed(4) : '—';
+    const foldStr = (c.fold_pos_count != null && c.fold_count != null) ?
+      `${c.fold_pos_count}/${c.fold_count} folds positive` : '—';
+    div.innerHTML = `
+      <div class="name">
+        <span>${c.name}</span>
+        <span class="pill ${c.enabled ? 'pill-on' : 'pill-off'}">${c.enabled ? 'ENABLED' : 'disabled'}</span>
+      </div>
+      <div class="row"><span>category</span><span class="v">${c.category || '—'}</span></div>
+      <div class="row"><span>n holdout</span><span class="v">${(c.n_holdout || 0).toLocaleString()}</span></div>
+      <div class="row"><span>DSR</span><span class="v">${dsrStr}</span></div>
+      <div class="row"><span>edge (log-loss)</span><span class="v ${cls(c.fold_edge_mean)}">${edgeStr}</span></div>
+      <div class="row"><span>folds positive</span><span class="v">${foldStr}</span></div>
+      <div class="row"><span>issued</span><span class="v">${c.issued_iso}</span></div>
+      <div class="reason">${c.reason || ''}</div>
+    `;
+    grid.appendChild(div);
+  }
+}
+
+function renderByCategory(rows) {
+  const tbody = document.getElementById('by-category');
+  tbody.innerHTML = '';
+  if (!rows.length) {
+    tbody.innerHTML = '<tr><td colspan="10" class="small">no activity yet</td></tr>';
+    return;
+  }
+  for (const b of rows) {
+    const isCert = _allowedCategories.has(b.category);
+    const tr = document.createElement('tr');
+    if (isCert) tr.classList.add('certified');
+    const certPill = isCert ? '<span class="pill pill-on">cert</span>' : '<span class="small">—</span>';
+    const winStr = b.win_rate != null ? (100 * b.win_rate).toFixed(0) + '%' : '—';
+    tr.innerHTML = `
+      <td><span class="pill pill-cat ${isCert ? 'allowed' : ''}">${b.category}</span></td>
+      <td>${certPill}</td>
+      <td class="num">${b.open_positions}</td>
+      <td class="num">${fmtUsd(b.open_value_bid)}</td>
+      <td class="num ${cls(b.open_unrealized_bid)}">${fmtUsd(b.open_unrealized_bid)}</td>
+      <td class="num small">${b.fills_24h} / ${b.fills_total}</td>
+      <td class="num">${fmtUsd(b.notional_total)}</td>
+      <td class="num">${b.resolved}</td>
+      <td class="num">${winStr}</td>
+      <td class="num ${cls(b.realized_pnl)}">${fmtUsd(b.realized_pnl)}</td>
     `;
     tbody.appendChild(tr);
   }
@@ -703,36 +1117,87 @@ function renderResolutions(rows) {
   }
 }
 
+let _navRows = [];
+
 function renderNavChart(rows) {
+  _navRows = rows;
   const c = document.getElementById('nav-chart');
   const ctx = c.getContext('2d');
   const dpr = window.devicePixelRatio || 1;
   c.width = c.clientWidth * dpr; c.height = c.clientHeight * dpr;
   ctx.scale(dpr, dpr);
-  ctx.clearRect(0, 0, c.clientWidth, c.clientHeight);
+  const W = c.clientWidth, H = c.clientHeight;
+  ctx.clearRect(0, 0, W, H);
+  document.getElementById('nav-tip').style.display = 'none';
+  const rangeLabel = document.getElementById('nav-range');
+
   if (!rows.length) {
     ctx.fillStyle = '#8b949e'; ctx.font='12px sans-serif';
-    ctx.fillText('not enough NAV history yet', 10, 20);
+    ctx.fillText('not enough NAV history yet', 16, 24);
+    rangeLabel.textContent = '';
     return;
   }
   const navs = rows.map(r => r.nav);
   const minN = Math.min(...navs), maxN = Math.max(...navs);
-  const pad = 12;
-  const W = c.clientWidth, H = c.clientHeight;
-  const xScale = i => pad + (i / (rows.length - 1 || 1)) * (W - 2*pad);
-  const yScale = v => pad + (1 - (v - minN) / ((maxN - minN) || 1)) * (H - 2*pad);
-  // Baseline at start NAV
+  const span = maxN - minN || 1;
+  const pad = { l: 56, r: 12, t: 14, b: 24 };
+  const xScale = i => pad.l + (i / (rows.length - 1 || 1)) * (W - pad.l - pad.r);
+  const yScale = v => pad.t + (1 - (v - minN) / span) * (H - pad.t - pad.b);
+
+  // Y-axis grid + labels (5 ticks)
+  ctx.strokeStyle = '#21262d';
+  ctx.fillStyle = '#8b949e';
+  ctx.font = '10px ui-monospace, monospace';
+  ctx.lineWidth = 1;
+  for (let k = 0; k <= 4; k++) {
+    const v = minN + (span * k / 4);
+    const y = yScale(v);
+    ctx.beginPath();
+    ctx.moveTo(pad.l, y); ctx.lineTo(W - pad.r, y);
+    ctx.stroke();
+    ctx.fillText('$' + v.toFixed(0), 4, y + 3);
+  }
+
+  // X-axis time labels (start, mid, end)
+  const fmtTime = ts => {
+    const d = new Date(ts * 1000);
+    return d.getHours().toString().padStart(2,'0') + ':' +
+           d.getMinutes().toString().padStart(2,'0');
+  };
+  ctx.textAlign = 'center';
+  for (const k of [0, 0.5, 1]) {
+    const i = Math.round(k * (rows.length - 1));
+    ctx.fillText(fmtTime(rows[i].ts), xScale(i), H - 8);
+  }
+  ctx.textAlign = 'start';
+
+  // Baseline at start NAV (dashed)
   const start = rows[0].nav;
   ctx.strokeStyle = '#30363d';
-  ctx.lineWidth = 1;
-  ctx.setLineDash([3,3]);
+  ctx.setLineDash([4,4]);
   ctx.beginPath();
-  ctx.moveTo(pad, yScale(start));
-  ctx.lineTo(W - pad, yScale(start));
+  ctx.moveTo(pad.l, yScale(start));
+  ctx.lineTo(W - pad.r, yScale(start));
   ctx.stroke();
   ctx.setLineDash([]);
+
+  // Filled area under curve
+  const last = navs[navs.length-1];
+  const lineColor = last >= start ? '#3fb950' : '#f85149';
+  const fillColor = last >= start ? 'rgba(63,185,80,0.10)' : 'rgba(248,81,73,0.10)';
+  ctx.fillStyle = fillColor;
+  ctx.beginPath();
+  rows.forEach((r, i) => {
+    const x = xScale(i), y = yScale(r.nav);
+    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  });
+  ctx.lineTo(xScale(rows.length-1), H - pad.b);
+  ctx.lineTo(xScale(0), H - pad.b);
+  ctx.closePath();
+  ctx.fill();
+
   // NAV line
-  ctx.strokeStyle = navs[navs.length-1] >= start ? '#3fb950' : '#f85149';
+  ctx.strokeStyle = lineColor;
   ctx.lineWidth = 2;
   ctx.beginPath();
   rows.forEach((r, i) => {
@@ -740,22 +1205,60 @@ function renderNavChart(rows) {
     if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
   });
   ctx.stroke();
-  // Range labels
-  ctx.fillStyle = '#8b949e'; ctx.font='10px sans-serif';
-  ctx.fillText('$' + maxN.toFixed(0), 4, 12);
-  ctx.fillText('$' + minN.toFixed(0), 4, H - 4);
+
+  // Latest dot
+  const lx = xScale(rows.length - 1), ly = yScale(last);
+  ctx.fillStyle = lineColor;
+  ctx.beginPath(); ctx.arc(lx, ly, 4, 0, 2*Math.PI); ctx.fill();
+  ctx.strokeStyle = lineColor + '40'; // halo
+  ctx.lineWidth = 6;
+  ctx.beginPath(); ctx.arc(lx, ly, 8, 0, 2*Math.PI); ctx.stroke();
+
+  rangeLabel.textContent =
+    `$${minN.toFixed(0)} – $${maxN.toFixed(0)} · ` +
+    `${rows.length} pts · ` +
+    `${((last - start) / start * 100).toFixed(2)}% from start`;
+
+  // Hover tooltip
+  c.onmousemove = e => {
+    const rect = c.getBoundingClientRect();
+    const mx = e.clientX - rect.left;
+    if (mx < pad.l || mx > W - pad.r) {
+      document.getElementById('nav-tip').style.display = 'none';
+      return;
+    }
+    const frac = (mx - pad.l) / (W - pad.l - pad.r);
+    const idx = Math.max(0, Math.min(rows.length - 1, Math.round(frac * (rows.length - 1))));
+    const r = rows[idx];
+    const tip = document.getElementById('nav-tip');
+    tip.style.display = 'block';
+    const wrap = document.getElementById('nav-chart-wrap');
+    const wrapRect = wrap.getBoundingClientRect();
+    tip.style.left = (e.clientX - wrapRect.left) + 'px';
+    tip.style.top = (yScale(r.nav) + wrap.getBoundingClientRect().top - wrapRect.top + 12) + 'px';
+    const dt = new Date(r.ts * 1000);
+    tip.innerHTML = `<b>${fmtUsd(r.nav)}</b> &nbsp;<span class="small">${dt.toLocaleTimeString()}</span>`;
+  };
+  c.onmouseleave = () => { document.getElementById('nav-tip').style.display = 'none'; };
 }
 
 async function loadAll() {
   try {
-    const [s, p, f, n, r] = await Promise.all([
+    // Certificates first so _allowedCategories is set before fills/positions
+    // render and pick up the certified-category highlighting.
+    const certs = await fetchJSON('/api/certificates');
+    renderCertificates(certs);
+
+    const [s, p, f, n, r, bc] = await Promise.all([
       fetchJSON('/api/summary'),
       fetchJSON('/api/positions'),
-      fetchJSON('/api/fills?limit=30'),
+      fetchJSON('/api/fills?limit=40'),
       fetchJSON('/api/nav-history?limit=500'),
       fetchJSON('/api/resolutions?limit=20'),
+      fetchJSON('/api/by-category'),
     ]);
     renderSummary(s);
+    renderByCategory(bc);
     renderPositions(p);
     renderFills(f);
     renderNavChart(n);
@@ -766,6 +1269,7 @@ async function loadAll() {
 }
 loadAll();
 setInterval(loadAll, 10000);
+window.addEventListener('resize', () => renderNavChart(_navRows));
 </script>
 </body>
 </html>
