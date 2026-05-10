@@ -41,6 +41,11 @@ log = structlog.get_logger()
 
 
 MODEL_ID = os.getenv("LLM_FORECASTER_MODEL", "openai/gpt-oss-20b")
+# Fallback when the primary model is missing locally and can't be
+# downloaded (HF rate limits, network issues). Phi-4-mini is smaller
+# (~7 GB BF16) and was the previous default, so it's a safe degradation.
+# Set to empty string to disable fallback entirely.
+FALLBACK_MODEL_ID = os.getenv("LLM_FORECASTER_FALLBACK_MODEL", "microsoft/Phi-4-mini-instruct")
 N_SAMPLES = int(os.getenv("LLM_FORECASTER_N_SAMPLES", "4"))
 TEMPS: list[float] = [
     float(t) for t in os.getenv("LLM_FORECASTER_TEMPS", "0.6,0.9").split(",")
@@ -90,21 +95,42 @@ def _get_pipe():
         import torch
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        log.info("llm_forecaster_loading", model=MODEL_ID, device=device)
-        try:
-            _tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
-            _model = AutoModelForCausalLM.from_pretrained(
-                MODEL_ID,
+
+        def _try_load(model_id: str):
+            log.info("llm_forecaster_loading", model=model_id, device=device)
+            tok = AutoTokenizer.from_pretrained(model_id)
+            mdl = AutoModelForCausalLM.from_pretrained(
+                model_id,
                 torch_dtype="auto",
                 device_map="auto" if device == "cuda" else None,
                 low_cpu_mem_usage=True,
             )
-            _model.eval()
-            log.info("llm_forecaster_ready", model=MODEL_ID, device=device)
+            mdl.eval()
+            log.info("llm_forecaster_ready", model=model_id, device=device)
+            return mdl, tok
+
+        # Primary attempt
+        try:
+            _model, _tokenizer = _try_load(MODEL_ID)
+            return _model, _tokenizer
         except Exception as e:
             log.warning("llm_forecaster_load_failed", err=str(e), model=MODEL_ID)
-            _model = None
-            _tokenizer = None
+
+        # Fallback attempt
+        if FALLBACK_MODEL_ID and FALLBACK_MODEL_ID != MODEL_ID:
+            try:
+                _model, _tokenizer = _try_load(FALLBACK_MODEL_ID)
+                log.info("llm_forecaster_using_fallback", model=FALLBACK_MODEL_ID)
+                return _model, _tokenizer
+            except Exception as e:
+                log.warning(
+                    "llm_forecaster_fallback_load_failed",
+                    err=str(e),
+                    model=FALLBACK_MODEL_ID,
+                )
+
+        _model = None
+        _tokenizer = None
         return _model, _tokenizer
 
 
@@ -240,14 +266,29 @@ class LLMForecaster:
             ]
             # Try to use the chat template if available (required for
             # gpt-oss harmony format; works for Phi-4 as well).
+            input_ids = None
             try:
-                input_ids = tokenizer.apply_chat_template(
+                templated = tokenizer.apply_chat_template(
                     messages,
                     add_generation_prompt=True,
                     return_tensors="pt",
                 )
+                # apply_chat_template can return: a Tensor, a list, or a
+                # BatchEncoding (transformers 5.x). Normalize to a 2D tensor.
+                import torch
+                if isinstance(templated, torch.Tensor):
+                    input_ids = templated
+                elif hasattr(templated, "input_ids"):
+                    input_ids = templated.input_ids
+                elif isinstance(templated, (list, tuple)):
+                    input_ids = torch.tensor([list(templated)], dtype=torch.long)
+                if input_ids is not None and input_ids.dim() == 1:
+                    input_ids = input_ids.unsqueeze(0)
             except Exception:
-                # Fall back to raw prompt for tokenizers without a chat template.
+                input_ids = None
+            if input_ids is None:
+                # Fall back to raw prompt for tokenizers without a working
+                # chat template.
                 input_ids = tokenizer(prompt, return_tensors="pt").input_ids
             input_ids = input_ids.to(model.device)
 
@@ -265,7 +306,13 @@ class LLMForecaster:
             text = tokenizer.decode(gen, skip_special_tokens=True)
             return text
         except Exception as e:
-            log.warning("llm_forecaster_generate_failed", err=str(e))
+            import traceback
+            log.warning(
+                "llm_forecaster_generate_failed",
+                err=str(e) or repr(e),
+                err_type=type(e).__name__,
+                traceback=traceback.format_exc(limit=3).splitlines()[-3:],
+            )
             return ""
 
     def forecast(self, question: str, articles: list[str]) -> dict | None:
