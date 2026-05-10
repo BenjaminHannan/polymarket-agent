@@ -67,6 +67,37 @@ _COMPOUND_PAT = re.compile(r"\b(and|or)\b", re.I)
 _NEGATION_PAT = re.compile(r"\b(not|never|won't|wont|fail to)\b", re.I)
 _PROPER_NOUN_RE = re.compile(r"\b[A-Z][a-z]{2,}\b")  # rough capitalized-word heuristic
 
+# ── Sports-specific patterns (sports_global certified at +0.128 log-loss;
+# these are surgical additions to widen the existing edge) ────────────────
+# Soccer/football clubs and league cues — most sports_global volume is
+# soccer match win/draw markets where the question wording is highly
+# templated.
+_SPORTS_GLOBAL_LEAGUE_RE = re.compile(
+    r"\b(world cup|fifa|champions league|premier league|la liga|bundesliga|"
+    r"serie a|ligue 1|copa|europa|euro|copa america|uefa|cup final|"
+    r"f(?:ormula)?\s?1|grand prix|gp|nascar|"
+    r"atp|wta|roland garros|wimbledon|us open|australian open|grand slam|"
+    r"icc|t20|odi|test match|cricket world|"
+    r"olympics?|paralympic|"
+    r"six nations|world rugby|super rugby|"
+    r"ufc|mma)\b",
+    re.I,
+)
+# Football club name suffixes (FC, United, City, Athletic, Real, etc.) —
+# strong signal that a question is a soccer match-win prediction
+_FOOTBALL_CLUB_RE = re.compile(
+    r"\b(FC|United|City|Athletic|Real|Bayern|PSG|Madrid|Barcelona|Liverpool|"
+    r"Chelsea|Arsenal|Tottenham|Juventus|Milan|Inter|Napoli|Roma|Dortmund|"
+    r"Atletico|Sevilla|Porto|Benfica|Ajax|Celtic|Rangers)\b"
+)
+# Match-type cues
+_MATCH_WIN_RE = re.compile(r"\bwin\s+(?:the|on|in|at)\b", re.I)
+_TOURNAMENT_WIN_RE = re.compile(r"\bwin\s+the\s+(world cup|champions league|premier league|cup|tournament|final)\b", re.I)
+# UFC/MMA fight format markers
+_UFC_RE = re.compile(r"\bUFC\b|\b(?:vs?\.?|\bmiddleweight|lightweight|welterweight|featherweight|bantamweight|heavyweight)\b", re.I)
+# ISO date pattern in question (lots of sports markets are dated)
+_ISO_DATE_RE = re.compile(r"\b\d{4}-\d{2}-\d{2}\b")
+
 
 def question_features(
     question: str,
@@ -110,6 +141,18 @@ def question_features(
         "days_to_resolution": float(days_to_resolution) if days_to_resolution is not None else 0.0,
         "has_ttr": 1.0 if days_to_resolution is not None else 0.0,
         "log1p_ttr": float(__import__("math").log1p(max(0.0, float(days_to_resolution or 0.0)))),
+        # Sports-specific (surgical additions for the certified sports_global
+        # slice; these features are zero on non-sports questions, so they only
+        # cost a few extra splits on irrelevant rows but give the model
+        # match-type / tournament discrimination on the sports slice).
+        "sports_league_hits": float(len(_SPORTS_GLOBAL_LEAGUE_RE.findall(q))),
+        "sports_has_league": 1.0 if _SPORTS_GLOBAL_LEAGUE_RE.search(q) else 0.0,
+        "sports_football_clubs": float(len(_FOOTBALL_CLUB_RE.findall(q))),
+        "sports_has_football_club": 1.0 if _FOOTBALL_CLUB_RE.search(q) else 0.0,
+        "sports_match_win": 1.0 if _MATCH_WIN_RE.search(q) else 0.0,
+        "sports_tournament_win": 1.0 if _TOURNAMENT_WIN_RE.search(q) else 0.0,
+        "sports_has_ufc": 1.0 if _UFC_RE.search(q) else 0.0,
+        "sports_has_iso_date": 1.0 if _ISO_DATE_RE.search(q) else 0.0,
     }
     feats.update({k: float(v) for k, v in _category_flags(q).items()})
     return feats

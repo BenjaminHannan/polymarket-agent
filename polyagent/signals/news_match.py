@@ -21,6 +21,7 @@ from polyagent.gamma import Market
 from polyagent.models.news_embed_matcher import SemanticMarketIndex
 from polyagent.news_store import NewsEvent, NewsStore
 from polyagent.signals.direction import DirectionResult, classify
+from polyagent.signals import news_verifier as _nli
 
 log = structlog.get_logger()
 
@@ -132,9 +133,45 @@ class NewsMatcher:
 
         # Persist all top-5 with a direction classification.
         best_for_trade: tuple[str, DirectionResult, float, int] | None = None
+        nli_enabled = _nli.is_enabled()
         for cid, overlap, shared, score in scored:
             question = self.index.questions[cid]
             direction = classify(text, question)
+
+            # NLI parallel verifier (A/B against the lexicon classifier).
+            # Logs a separate `news_nli_match` signal so we can audit hit-rate
+            # vs. the lexicon baseline once enough markets have resolved.
+            # Default OFF; activate via ENABLE_NLI_VERIFIER=1.
+            nli_detail: dict | None = None
+            if nli_enabled:
+                try:
+                    r = _nli.verify(evt.title, question, body=evt.body)
+                except Exception as e:
+                    log.warning("nli_verify_error", err=str(e))
+                    r = None
+                if r is not None:
+                    nli_detail = {
+                        "direction": r.direction,
+                        "confidence": round(r.confidence, 4),
+                        "p_entail_yes": round(r.p_entail_yes, 4),
+                        "p_entail_no": round(r.p_entail_no, 4),
+                        "margin": round(r.margin, 4),
+                        "elapsed_ms": round(r.elapsed_ms, 1),
+                        "yes_hyp": r.yes_hypothesis[:120],
+                        "no_hyp": r.no_hypothesis[:120],
+                        "source": evt.source,
+                        "title": evt.title[:140],
+                        "lexicon_direction": direction.direction,
+                    }
+                    await self.store.insert_signal(
+                        strategy="news_nli_match",
+                        condition_id=cid,
+                        direction=r.direction,
+                        score=r.confidence,
+                        news_hash=h,
+                        detail=nli_detail,
+                    )
+
             await self.store.insert_signal(
                 strategy="news_keyword_match",
                 condition_id=cid,
@@ -151,6 +188,7 @@ class NewsMatcher:
                     "sentiment": direction.sentiment,
                     "confidence": direction.confidence,
                     "polarity": direction.polarity,
+                    **({"nli": nli_detail} if nli_detail else {}),
                 },
             )
             log.info(
