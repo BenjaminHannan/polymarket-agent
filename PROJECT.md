@@ -1457,3 +1457,81 @@ Whether this bot makes money over the next 1,500 forward trades is
 now an empirical question only forward time can answer. The code
 side of the literature audit is complete.
 
+---
+
+## Session log: May 10, 2026 (late evening) — wash-volume hypothesis falsified
+
+The morning's session-end framing flagged the Sirolly Nov 2025
+wash-trade contamination as the *one* model lever where the
+empirical answer doesn't require 1,500 forward trades: replace
+`volume` and `log_volume` (Sirolly's "must be replaced" features on
+sports) with wash-robust `trade_count_24h` / `net_flow_24h` /
+`unique_wallets_24h` / `top_wallet_share` features computed from the
+176K-row `historical_trades` table.
+
+`scripts/eval_decontaminated_features.py` was built to answer the
+question with a chronological 80/20 train/test split on the n=697
+sports_global resolutions:
+
+| Variant | Brier | log_loss | AUC | ECE |
+|---|---|---|---|---|
+| **v2 (production, volume features)** | 0.0759 | 0.3509 | **0.7822** | 0.0677 |
+| **v3 (flow features, volume removed)** | 0.0760 | 0.3356 | **0.6025** ⬇ | 0.0665 |
+| **v4 (volume + flow together)** | 0.0759 | 0.3509 | 0.7822 | 0.0677 |
+
+### Result
+
+**Hypothesis falsified.** Three findings:
+
+1. **`volume` is the top-1 feature in v2 by LightGBM gain importance.**
+   Removing it collapses AUC by **−0.18** (0.78 → 0.60). The
+   discriminative signal in volume is real and large.
+2. **The naive flow features don't recover that signal.** None of
+   `trade_count_24h_pre`, `net_flow_24h_pre`, `unique_wallets_24h_pre`,
+   `top_wallet_share_pre` made the v3 top-5 by importance. They're
+   more wash-robust *but* they discard the market-importance /
+   question-quality correlations that volume implicitly encodes.
+3. **v4 (both) is identical to v2 to 4 decimal places.** With volume
+   available, the LightGBM ignores the flow features entirely. They
+   carry zero incremental information on top of volume on this slice.
+
+### Honest interpretation
+
+Sirolly's published wash-share number (~20% steady-state, 60% Dec 2024
+peak on sports) is real, but the 80% real-flow component in `volume`
+still carries strong discriminative signal that exceeds the
+wash-noise floor on the certified slice. The doc's framing — "volume
+features must be replaced on sports_global" — was overstated for our
+specific cohort and feature stack.
+
+### What this changes
+
+- **`features.py` is NOT modified.** The volume features stay in
+  production. The current `sports_global` cert is *better-supported*
+  than before this experiment because we explicitly tested the
+  wash-contamination critique and the data rejected the alternative.
+- **`scripts/eval_decontaminated_features.py` is preserved** as the
+  falsifiability artefact — anyone re-checking the certification
+  can re-run the experiment.
+- **No retraining, no recert, no live-portfolio impact.** The bot
+  continues running as configured.
+
+### What we learned about the process
+
+The user's analytical framing was correct: *this* model improvement was
+the only one in the doc-list with a same-day answer, no waiting for
+forward data, surface bounded to one script + one feature swap. We
+ran the experiment, the hypothesis lost, and the right action is to
+*not* ship the change. That's the right outcome of a falsifiability
+loop — the cert survives a real test rather than absorbing more
+features as scaffolding.
+
+### Cumulative discipline rule
+
+When a published literature claim cites a contamination level
+(e.g. Sirolly's 20%), the right next step is *measure the gradient
+of model performance against that contamination on our specific
+data*, not silently strip the feature on the assumption that the
+literature applies. The model's signal-to-noise floor is dataset-
+specific; the published number is a population average.
+
