@@ -111,6 +111,24 @@ class CombinedTrader:
     # candidates whose Venn-Abers interval width is above the
     # target-coverage quantile of recent widths.
     selective_gate: SelectiveGate | None = None
+    # Likelihood-ratio selective abstention (Heng & Soh ICLR 2025,
+    # arXiv 2505.15008). Complementary to the width-based selective_gate:
+    # the Neyman-Pearson optimal selection score under covariate shift is
+    # a likelihood ratio, not a confidence threshold. When set, on_signal
+    # also requires the LR gate to admit. Both gates must say "admit" for
+    # the trade to proceed (intersection-of-rules — strictly conservative).
+    lr_gate: object | None = None
+    # VPIN toxicity gate (Bartlett-O'Hara 2026). When set, taker trades
+    # against toxic one-sided flow are blocked. For the taker
+    # combined_trader the side argument is the *side we'd hit*: BUY for
+    # crossing the ask, SELL for crossing the bid. Toxic flow against
+    # *our* trade is what concerns us (so we don't buy into a wave of
+    # buyers we can't compete with).
+    vpin_gate: object | None = None
+    # Optional sqlite handle for wash-graph suppression. When set,
+    # on_signal multiplies the Kelly fraction by `(1 − wash_share)` for
+    # the market — high-wash markets get smaller bets.
+    wash_graph_conn: object | None = None
     # BOCPD changepoint gate (§9). Provides a global size multiplier
     # (1.0 normally, 0.5 for K trades after a detected regime change
     # in win-rate). Multiplied into the Kelly stack alongside
@@ -227,6 +245,70 @@ class CombinedTrader:
                     category=category,
                     p_low=round(p_combined_low, 4) if p_combined_low is not None else None,
                     p_high=round(p_combined_high, 4) if p_combined_high is not None else None,
+                )
+                return
+
+        # LIKELIHOOD-RATIO GATE (Heng & Soh ICLR 2025, arXiv 2505.15008).
+        # Complement to the width-based selective_gate. Score the
+        # (model_p, market_p, |gap|, ask_size) feature vector against
+        # the historical "we got it right" distribution; admit only when
+        # the score is in the top coverage-fraction by RLog. The two
+        # gates must BOTH admit for the trade to proceed — strictly
+        # conservative composition.
+        if self.lr_gate is not None:
+            ask = self.book_store.books.get(token_id)
+            ask_size_for_lr = 0.0
+            try:
+                if ask is not None:
+                    bb = ask.best_ask()
+                    if bb is not None:
+                        ask_size_for_lr = float(bb[1])
+            except Exception:
+                ask_size_for_lr = 0.0
+            features = [
+                float(p_combined),
+                float(p_market),
+                abs(float(p_combined) - float(p_market)),
+                float(ask_size_for_lr),
+            ]
+            if not self.lr_gate.admit(features):
+                log.info(
+                    "combined_trade_skip_lr_gate",
+                    category=category,
+                    p_combined=round(p_combined, 4),
+                    p_market=round(p_market, 4),
+                )
+                return
+
+        # VPIN GATE (Bartlett-O'Hara 2026 / Barzykin et al. 2025). For
+        # the taker side: edge_raw > 0 means we'd BUY YES (cross the
+        # ask); the gate blocks if recent flow is toxically aligned with
+        # us (buyers everywhere — adverse selection against the late
+        # buyer). edge_raw < 0 means we'd SELL YES; blocked if flow is
+        # heavy SELL. Note the inverted semantics vs maker: as a taker
+        # we lose when flow is *aligned* with our direction (we paid
+        # the worst price), not against.
+        if self.vpin_gate is not None:
+            taker_side = "BUY" if (p_combined - p_market) > 0 else "SELL"
+            try:
+                # Re-use maker's allow_quote API but invert the side: a
+                # quote on BUY-side (passive bid) gets blocked when flow
+                # is sell-heavy *against* it; for a taker buying, the
+                # mirror condition is buy-heavy flow that's already
+                # exhausted the favourable side. So we check the
+                # *opposite* side: a taker BUY is blocked when posting a
+                # SELL quote would be blocked, etc.
+                opp_side = "SELL" if taker_side == "BUY" else "BUY"
+                allow, info = self.vpin_gate.allow_quote(token_id, opp_side)
+            except Exception:
+                allow = True
+                info = {}
+            if not allow:
+                log.info(
+                    "combined_trade_skip_vpin",
+                    category=category,
+                    taker_side=taker_side,
+                    info=info,
                 )
                 return
 
@@ -406,25 +488,32 @@ class CombinedTrader:
         if ask_price * ask_size < self.min_ask_depth_usd:
             return
 
-        # Conformal-Kelly (idea #9, Vovk): when the cell has a Venn-Abers
-        # calibrator we get a worst-case probability bound. Size on the
-        # *lower* bound (worst case for our directional bet) instead of
-        # the point estimate — turns "Kelly with a guess" into "Kelly with
-        # a finite-sample guarantee". Falls back to the point if no bound.
+        # Conformal-Kelly (Sun & Boyd 2019; Vovk 2025): when the cell has
+        # a Venn-Abers calibrator we get a worst-case probability bound.
+        # Size on the *worst case* across [p_low, p_high] instead of the
+        # point estimate — turns "Kelly with a guess" into "Kelly with a
+        # finite-sample guarantee". Falls back to the point if no bound.
+        # See polyagent/risk/conformal_kelly.py for the formal API; the
+        # call below uses the same Sun-Boyd worst-case formula.
+        from polyagent.risk.conformal_kelly import robust_kelly_fraction
         if p_combined_low is not None and 0.0 < p_combined_low < 1.0:
-            if edge_raw > 0:
-                # Buying YES: worst case is lower combined p
-                p_for_kelly = p_combined_low
-            else:
-                # Buying NO: worst case is higher YES → lower NO
-                p_for_kelly = 1.0 - max(p_combined, p_combined_low)
-                # If interval doesn't include p_combined upper, this is fine
-            p_for_kelly = max(0.001, min(0.999, p_for_kelly))
+            # For BUY (edge_raw > 0), pass [p_low, p_high] = [p_low, p_combined].
+            # For SELL (edge_raw < 0), the SELL gate inside robust_kelly_fraction
+            # picks the high end of the interval. We pass p_low ≤ p_combined as
+            # the inclusive bounds — robust_kelly_fraction handles side-specific
+            # worst-case selection internally.
+            side_str = "BUY" if edge_raw > 0 else "SELL"
+            dec = robust_kelly_fraction(
+                p_low=max(0.001, min(0.999, p_combined_low)),
+                p_high=max(0.001, min(0.999, max(p_combined_low, p_combined))),
+                price=ask_price,
+                side=side_str,
+                kelly_mult=1.0,   # multiplier applied later
+            )
+            f_full = dec.fraction
         else:
-            p_for_kelly = p
-
-        # Full Kelly: f* = (p_worst - q) / (1 - q)
-        f_full = (p_for_kelly - ask_price) / (1.0 - ask_price)
+            # Point-estimate fallback (no Venn-Abers interval available).
+            f_full = max(0.0, (p - ask_price) / (1.0 - ask_price))
         if f_full <= 0:
             return
 
@@ -449,9 +538,21 @@ class CombinedTrader:
                 bocpd_scale = float(self.bocpd_gate.size_multiplier())
             except Exception:
                 bocpd_scale = 1.0
+        # Wash-graph suppression (Sirolly Nov 2025). Markets contaminated
+        # by wash-trade volume have noisy / misleading book signals —
+        # shrink the bet proportionally to the wash share so we trade
+        # smaller in markets where size data is unreliable.
+        wash_scale = 1.0
+        if self.wash_graph_conn is not None:
+            try:
+                from polyagent.risk.wash_graph import suppression_factor
+                wash_scale = float(suppression_factor(self.wash_graph_conn, token_id))
+            except Exception:
+                wash_scale = 1.0
         f_used = min(
             self.max_per_trade_kelly,
-            self.kelly_mult * f_full * throttle * dd_scale * bandit_scale * bocpd_scale,
+            self.kelly_mult * f_full * throttle * dd_scale * bandit_scale
+            * bocpd_scale * wash_scale,
         )
         if f_used <= 0:
             return

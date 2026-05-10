@@ -170,6 +170,15 @@ class PassivePosterV2:
     stale_mid_ticks: float = 2.0
     # Cert allowlist (built from strategy_certificates)
     certified_categories: set[str] | None = None
+    # Optional VPIN toxicity gate (Bartlett-O'Hara 2026 / Barzykin
+    # arXiv 2508.20225). When set, we skip posting a side when flow
+    # is toxically one-sided against it. The gate is supplied by main.py
+    # and shared with BookStore which feeds it taker-initiated trades.
+    vpin_gate: object | None = None
+    # Optional sqlite handle for wash-graph suppression lookups. When
+    # set, the per-token wash_share suppresses our quote size linearly:
+    # size_effective = quote_size × (1 − wash_share).
+    wash_graph_conn: object | None = None
     # Strategy name for logs / fills.strategy
     strategy_name: str = "passive_poster_v2"
     # Per-token quote state
@@ -291,7 +300,7 @@ class PassivePosterV2:
             is_yes_token=is_yes,
             bid_price=round(bid_price, 4),
             ask_price=round(ask_price, 4),
-            quote_size=self.quote_size,
+            quote_size=self._effective_quote_size(token_id),
             inventory=inventory_this_token,
             mid_at_post=mid,
             one_sided_unwind=one_sided,
@@ -551,15 +560,46 @@ class PassivePosterV2:
 
         # Try virtual fills on each side, but skip the side suppressed
         # by the inventory-unwind logic (its quote is at the boundary
-        # tick and effectively unfillable).
-        if quote.unwind_side != "BUY":
+        # tick and effectively unfillable). Also consult the VPIN gate:
+        # a maker quote against toxic one-sided flow is blocked before
+        # it ever gets the chance to be picked off (pmwhybetter.md
+        # Problem-1 fix #5; Bartlett-O'Hara 2026).
+        if quote.unwind_side != "BUY" and self._vpin_allow(token_id, "BUY"):
             if await self._draw_passive_fill(quote, book, "BUY", quote.bid_price):
                 await self._record_fill(quote, "BUY", quote.bid_price, book)
-        if quote.unwind_side != "SELL":
+        if quote.unwind_side != "SELL" and self._vpin_allow(token_id, "SELL"):
             if await self._draw_passive_fill(quote, book, "SELL", quote.ask_price):
                 if inv > 0:
                     await self._record_fill(quote, "SELL", quote.ask_price, book)
         self._last_cycle_ts[token_id] = time.time()
+
+    def _vpin_allow(self, token_id: str, side: str) -> bool:
+        """Consult the VPIN gate if attached. Returns True (allow) when
+        the gate is absent or permits the quote."""
+        if self.vpin_gate is None:
+            return True
+        try:
+            allow, _ = self.vpin_gate.allow_quote(token_id, side)
+        except Exception as e:
+            log.warning("vpin_gate_error", err=str(e))
+            return True
+        if not allow:
+            log.info("passive_v2_vpin_blocked", token=token_id[:14], side=side)
+        return bool(allow)
+
+    def _effective_quote_size(self, token_id: str) -> float:
+        """Apply wash-graph suppression to the configured quote_size.
+        Returns the size to actually post; `quote_size × (1 − wash_share)`
+        clamped to a minimum 1 share so we don't post zero-size quotes."""
+        if self.wash_graph_conn is None:
+            return float(self.quote_size)
+        try:
+            from polyagent.risk.wash_graph import suppression_factor
+            factor = suppression_factor(self.wash_graph_conn, token_id)
+        except Exception:
+            return float(self.quote_size)
+        size = max(1.0, self.quote_size * factor)
+        return float(size)
 
     async def _cycle_token(self, token_id: str) -> None:
         """Backwards-compat shim: iterate both YES and NO sides of the

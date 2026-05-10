@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import signal
 
 import structlog
@@ -559,6 +560,73 @@ async def run() -> None:
                     db_path=_ba_db,
                     n_tokens=len(target_tokens),
                     interval_sec=settings.book_archive_periodic_sec,
+                )
+
+            # Periodic refresh of wash-graph (Sirolly Nov 2025) and
+            # wallet-orthogonality (Della Vedova 2026) scores. These read
+            # the `trades` table populated by the polymarket-trades
+            # backfill / live ingest and emit per-wallet + per-market
+            # scores. Cadence is conservative — once an hour — because
+            # both are O(n_wallets × n_counterparties) and we don't need
+            # real-time freshness; smart-money signal moves slowly.
+            if os.getenv("ENABLE_WALLET_ANALYTICS", "1") == "1":
+                async def _wallet_analytics_loop():
+                    import sqlite3 as _sqlite3
+                    from polyagent.signals.wallet_orthogonality import (
+                        compute_wallet_stats,
+                    )
+                    from polyagent.risk.wash_graph import (
+                        compute_wallet_signatures,
+                        compute_market_wash_scores,
+                    )
+                    while True:
+                        try:
+                            conn = _sqlite3.connect(settings.db_path, timeout=30.0)
+                            try:
+                                conn.execute("PRAGMA busy_timeout=30000")
+                                # Della Vedova orthogonality test:
+                                compute_wallet_stats(
+                                    conn, p_threshold=0.01, min_trades=50,
+                                )
+                                # Sirolly wash-graph scores:
+                                compute_wallet_signatures(conn)
+                                compute_market_wash_scores(conn)
+                            finally:
+                                conn.close()
+                        except Exception as e:
+                            log.warning("wallet_analytics_error", err=str(e))
+                        # Run once per hour.
+                        await asyncio.sleep(3600.0)
+
+                tasks.append(_spawn(
+                    "wallet_analytics",
+                    lambda: _wallet_analytics_loop(),
+                ))
+                log.info("wallet_analytics_loaded", interval_sec=3600)
+
+            # On-chain OrderFilled ingester (Dubach 2026, arXiv 2604.24366).
+            # Polls Polygon RPC for the canonical OrderFilled event and
+            # writes rows to `trades` with direction_source='onchain' so
+            # downstream consumers (VPIN gate, wash graph, smart-money,
+            # Della Vedova orthogonality) prefer on-chain ground truth
+            # over the WSS feed's ~59%-accurate Lee-Ready inference.
+            # Self-disables when ALCHEMY_RPC_URL / POLYGON_RPC_URL is unset.
+            if os.getenv("ENABLE_ONCHAIN_INGESTER", "1") == "1":
+                from polyagent.data.onchain_orderfilled import (
+                    run_onchain_ingester,
+                )
+                tasks.append(_spawn(
+                    "onchain_orderfilled_ingester",
+                    lambda: run_onchain_ingester(
+                        settings.db_path,
+                        poll_sec=float(os.getenv("ONCHAIN_POLL_SEC", "60")),
+                        blocks_per_poll=int(os.getenv("ONCHAIN_BLOCKS_PER_POLL", "1000")),
+                        max_blocks_lookback=int(os.getenv("ONCHAIN_MAX_LOOKBACK", "10000")),
+                    ),
+                ))
+                log.info(
+                    "onchain_ingester_supervised_attached",
+                    poll_sec=float(os.getenv("ONCHAIN_POLL_SEC", "60")),
                 )
 
         # Shared LLM forecaster + consistency-check state. The runtime task

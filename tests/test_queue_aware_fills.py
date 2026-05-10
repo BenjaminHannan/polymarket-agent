@@ -111,18 +111,23 @@ def test_passive_fill_with_flow_rate_horizon_too_short():
 
 def test_passive_fill_imbalance_fallback_no_flow_rate():
     # Bid-heavy book: posting on the bid side should be HARDER (less likely
-    # to be hit since opp-flow is sparse).
+    # to be hit since opp-flow is sparse). After the power_prob_queue_model=3
+    # upgrade (Feb 2025 hftbacktest default), the queue survival term
+    # is cubic so the disparity is large.
     b = _book(bids={0.49: 1000, 0.48: 1000}, asks={0.51: 50, 0.52: 30})
     r = simulate_passive_fill(b, "BUY", 0.49, 50, horizon_sec=60)
     assert r is not None
-    # Bid-heavy → bid_share high → posting BUY harder → bias negative on prob
+    # Bid-heavy → bid_share high → posting BUY harder → low fill prob
     assert r.fill_prob < 0.5
 
-    # Ask-heavy: posting BUY on bid side should be easier
+    # Ask-heavy: posting BUY on bid side should be MORE LIKELY than the
+    # bid-heavy case. The cubic queue-survival term still dominates for
+    # any non-trivial queue_ahead, so we don't require > 0.5 — only
+    # better than the bid-heavy case.
     b2 = _book(bids={0.49: 50, 0.48: 30}, asks={0.51: 1000, 0.52: 1000})
     r2 = simulate_passive_fill(b2, "BUY", 0.49, 50, horizon_sec=60)
     assert r2 is not None
-    assert r2.fill_prob > 0.5
+    assert r2.fill_prob > r.fill_prob
 
 
 def test_passive_fill_returns_none_on_empty_book():

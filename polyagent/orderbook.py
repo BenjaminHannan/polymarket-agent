@@ -198,6 +198,15 @@ class BookStore:
         # book change / trade event is forwarded so the filter can compute
         # per-token wash share and blacklist anomalous markets.
         self.wash_filter = None
+        # Optional VPIN toxicity gate (pmwhybetter.md problem-1 fix #5).
+        # When set, last_trade_price events feed `record_trade(token, side,
+        # size)`. Lee-Ready direction is inferred from price vs prior mid
+        # (warned in Dubach 2026 fact #6: ~59% accuracy on the WSS feed —
+        # the gate compensates with a more conservative VPIN threshold).
+        self.vpin_gate = None
+        # Track per-token last-known mid so we can do trade-direction
+        # inference from price-vs-mid even when the WSS event lacks a side.
+        self._last_mid_for_direction: dict[str, float] = {}
 
     def get(self, token_id: str) -> OrderBook:
         b = self.books.get(token_id)
@@ -241,6 +250,23 @@ class BookStore:
             book.apply_trade(msg)
             if self.wash_filter is not None:
                 self.wash_filter.on_trade(str(token_id))
+            if self.vpin_gate is not None:
+                # Lee-Ready inference: trade above prior mid is taker BUY,
+                # below is taker SELL. Size from the message if present,
+                # else a unit fallback so VPIN at least counts the event.
+                try:
+                    px = float(msg.get("price"))
+                    sz = float(msg.get("size", 1.0))
+                    prior_mid = self._last_mid_for_direction.get(str(token_id))
+                    cur_mid = book.mid()
+                    ref = prior_mid if prior_mid is not None else cur_mid
+                    if ref is not None and sz > 0:
+                        side = "BUY" if px >= ref else "SELL"
+                        self.vpin_gate.record_trade(str(token_id), side, sz)
+                    if cur_mid is not None:
+                        self._last_mid_for_direction[str(token_id)] = cur_mid
+                except (TypeError, ValueError, KeyError):
+                    pass
         elif event_type == "tick_size_change":
             try:
                 book.tick_size = float(msg.get("new_tick_size", book.tick_size))

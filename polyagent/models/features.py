@@ -165,6 +165,12 @@ class BookSnapshot:
     yes_spread: float | None = None
     yes_best_ask: float | None = None
     yes_best_bid: float | None = None
+    # Optional reference to the live YES OrderBook for micro-structure
+    # feature extraction (pmwhybetter.md Problem-10 fix #4: micro-price,
+    # VAMP, queue-imbalance — Gould & Bonart 2015, Stoikov 2017).
+    # When provided, live_features() pulls these features in addition to
+    # the legacy mid/spread/longshot triple.
+    yes_book: object | None = None
 
 
 def live_features(question: str, snap: BookSnapshot, *, liquidity: float = 0.0, volume: float = 0.0) -> dict[str, float]:
@@ -177,4 +183,38 @@ def live_features(question: str, snap: BookSnapshot, *, liquidity: float = 0.0, 
         feats["mkt_midrange_yes"] = 1.0 if 0.40 <= snap.yes_mid <= 0.60 else 0.0
     if snap.yes_spread is not None:
         feats["mkt_spread"] = float(snap.yes_spread)
+
+    # Microstructure features (pmwhybetter.md Problem-10 fix #4). These are
+    # the cross-asset SHAP-stable feature family from arXiv 2602.00776
+    # (Dec 2025) — order-book-imbalance + adverse-selection features rank
+    # stably across BTC/LTC/ETC/ENJ/ROSE. We compute them best-effort and
+    # leave them out of the feature dict if the book reference is absent
+    # so legacy training data isn't disturbed.
+    if snap.yes_book is not None:
+        try:
+            from polyagent.models.microprice import compute_features as _ms_features
+            ms = _ms_features(snap.yes_book, vamp_notional=500.0)
+            if ms.micro is not None:
+                feats["mkt_micro_price"] = float(ms.micro)
+                # Micro-vs-mid difference is a queue-pressure signal in bps.
+                if snap.yes_mid is not None:
+                    feats["mkt_micro_minus_mid_bps"] = float(
+                        (ms.micro - snap.yes_mid) * 10_000.0
+                    )
+            if ms.queue_imbalance is not None:
+                feats["mkt_queue_imbalance"] = float(ms.queue_imbalance)
+            if ms.vamp_buy is not None and snap.yes_mid is not None:
+                feats["mkt_vamp_buy_minus_mid_bps"] = float(
+                    (ms.vamp_buy - snap.yes_mid) * 10_000.0
+                )
+            if ms.vamp_sell is not None and snap.yes_mid is not None:
+                feats["mkt_vamp_sell_minus_mid_bps"] = float(
+                    (ms.vamp_sell - snap.yes_mid) * 10_000.0
+                )
+            feats["mkt_bid_levels"] = float(ms.bid_levels)
+            feats["mkt_ask_levels"] = float(ms.ask_levels)
+        except Exception:
+            # Don't let feature extraction errors crash the predictor — we
+            # silently drop the microstructure features.
+            pass
     return feats
