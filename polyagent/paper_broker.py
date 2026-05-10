@@ -161,14 +161,42 @@ class PaperBroker:
                 levels_walked INTEGER,
                 partial INTEGER,
                 slippage_bps_walked REAL,
-                slippage_bps_pess REAL
+                slippage_bps_pess REAL,
+                is_maker INTEGER DEFAULT 0,
+                taker_fee_paid REAL DEFAULT 0,
+                maker_rebate_credited REAL DEFAULT 0,
+                cancel_latency_penalty REAL DEFAULT 0,
+                effective_fill_price REAL
             );
             CREATE INDEX IF NOT EXISTS fills_shadow_queue_fid ON fills_shadow_queue(fill_id);
             """
         )
         await self.db.commit()
         await self._migrate_nav_history()
+        await self._migrate_fills_shadow_queue()
         await self._recover_state()
+
+    async def _migrate_fills_shadow_queue(self) -> None:
+        """Add fee/rebate/maker columns to fills_shadow_queue if upgrading
+        from a pre-fee schema. Idempotent: if the columns already exist
+        the ADD COLUMN raises and we swallow."""
+        if self.db is None:
+            return
+        async with self.db.execute("PRAGMA table_info(fills_shadow_queue)") as cur:
+            cols = {r[1] for r in await cur.fetchall()}
+        for col, ddl in [
+            ("is_maker", "ALTER TABLE fills_shadow_queue ADD COLUMN is_maker INTEGER DEFAULT 0"),
+            ("taker_fee_paid", "ALTER TABLE fills_shadow_queue ADD COLUMN taker_fee_paid REAL DEFAULT 0"),
+            ("maker_rebate_credited", "ALTER TABLE fills_shadow_queue ADD COLUMN maker_rebate_credited REAL DEFAULT 0"),
+            ("cancel_latency_penalty", "ALTER TABLE fills_shadow_queue ADD COLUMN cancel_latency_penalty REAL DEFAULT 0"),
+            ("effective_fill_price", "ALTER TABLE fills_shadow_queue ADD COLUMN effective_fill_price REAL"),
+        ]:
+            if col not in cols:
+                try:
+                    await self.db.execute(ddl)
+                except Exception as e:
+                    log.warning("fills_shadow_queue_migrate_failed", col=col, err=str(e))
+        await self.db.commit()
 
     async def _migrate_nav_history(self) -> None:
         """Older versions had `ts` as PRIMARY KEY, which loses snapshots when
@@ -389,11 +417,19 @@ class PaperBroker:
         max_size: float,
         max_price: float | None = None,
         reason: str = "",
+        is_maker: bool = False,
+        category: str | None = None,
     ) -> float:
         """Simulate a marketable order. Returns filled size (number of shares).
 
         Concurrency-safe: serializes via self._lock so concurrent strategies
         can't race on cash / positions.
+
+        is_maker — when True, fee accounting credits a maker rebate and
+        applies a cancel-latency penalty to the recorded effective price
+        (Polygon block ≈ 2 s of adverse drift). Default False (taker).
+        category — passed in by callers that know it (e.g. passive_poster_v2);
+        used by the per-category fee curve in polyagent.risk.fees.
         """
         async with self._lock:
             return await self._submit_locked(
@@ -404,6 +440,8 @@ class PaperBroker:
                 max_size=max_size,
                 max_price=max_price,
                 reason=reason,
+                is_maker=is_maker,
+                category=category,
             )
 
     async def _submit_locked(
@@ -416,6 +454,8 @@ class PaperBroker:
         max_size: float,
         max_price: float | None,
         reason: str,
+        is_maker: bool = False,
+        category: str | None = None,
     ) -> float:
         side = side.upper()
         # Kill switch: refuse all new BUYs if data/.STOP exists. SELLs go through
@@ -566,16 +606,39 @@ class PaperBroker:
             # honestly to record what the multi-level VWAP would have
             # been at this moment, alongside the closed-form pessimistic.
             # This lets us re-validate certs under realistic taker fills.
+            #
+            # Also applies maker rebate / taker fee accounting and a
+            # cancel-latency penalty on maker fills (Polygon ~2 s block:
+            # a resting limit can't dodge adverse mid moves faster than
+            # the next block, so paper-mode P&L is honestly discounted
+            # by σ × √block_sec on every maker fill).
             try:
                 from polyagent.risk.queue_aware_fills import compare_fill_models
+                from polyagent.risk.fees import compute_fees, cancel_latency_penalty
                 cmp = compare_fill_models(book, side, size)
+                # Fees / rebate accounting
+                fees = compute_fees(
+                    notional=notional,
+                    category=category,
+                    is_maker=is_maker,
+                )
+                # Cancel-latency penalty (maker only — takers fill instantly)
+                rv = book.realized_vol(300) if hasattr(book, "realized_vol") else None
+                if is_maker:
+                    eff_price = cancel_latency_penalty(price, side, rv)
+                    cl_penalty = abs(eff_price - price) * size
+                else:
+                    eff_price = price
+                    cl_penalty = 0.0
                 if cmp.get("available"):
                     await self.db.execute(
                         """INSERT INTO fills_shadow_queue
                            (fill_id, top_of_book_price, walked_vwap_price,
                             pessimistic_price, size, levels_walked, partial,
-                            slippage_bps_walked, slippage_bps_pess)
-                           VALUES (?,?,?,?,?,?,?,?,?)""",
+                            slippage_bps_walked, slippage_bps_pess,
+                            is_maker, taker_fee_paid, maker_rebate_credited,
+                            cancel_latency_penalty, effective_fill_price)
+                           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                         (
                             fill_id,
                             cmp["top_of_book"],
@@ -586,8 +649,43 @@ class PaperBroker:
                             int(bool(cmp["partial"])),
                             cmp["slippage_bps_walked"],
                             cmp["slippage_bps_pess"],
+                            int(is_maker),
+                            fees.taker_fee_paid,
+                            fees.maker_rebate_credited,
+                            cl_penalty,
+                            eff_price,
                         ),
                     )
+                else:
+                    # Even if compare_fill_models couldn't return a walked
+                    # VWAP (empty book), still record fee/rebate so paper
+                    # P&L is honest.
+                    await self.db.execute(
+                        """INSERT INTO fills_shadow_queue
+                           (fill_id, top_of_book_price, walked_vwap_price,
+                            pessimistic_price, size, levels_walked, partial,
+                            slippage_bps_walked, slippage_bps_pess,
+                            is_maker, taker_fee_paid, maker_rebate_credited,
+                            cancel_latency_penalty, effective_fill_price)
+                           VALUES (?, NULL, NULL, NULL, ?, NULL, NULL, NULL, NULL,
+                                   ?, ?, ?, ?, ?)""",
+                        (
+                            fill_id, size,
+                            int(is_maker),
+                            fees.taker_fee_paid,
+                            fees.maker_rebate_credited,
+                            cl_penalty,
+                            eff_price,
+                        ),
+                    )
+                # Apply fee/rebate to cash so live broker state reflects
+                # paper P&L honestly. Taker fees DEBIT cash; maker
+                # rebates CREDIT it. Maker rebate is paper-mode bookkeeping;
+                # a real-money build would receive USDC daily.
+                if fees.taker_fee_paid > 0:
+                    self.cash -= fees.taker_fee_paid
+                if fees.maker_rebate_credited > 0:
+                    self.cash += fees.maker_rebate_credited
             except Exception as e:
                 log.warning("queue_shadow_write_failed", err=str(e))
             await self.db.commit()

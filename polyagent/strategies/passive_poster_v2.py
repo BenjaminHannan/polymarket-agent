@@ -259,6 +259,8 @@ class PassivePosterV2:
             max_size=quote.quote_size,
             max_price=post_price + 1e-9 if side == "BUY" else post_price - 1e-9,
             reason=f"passive_v2 {side} @ {post_price:.4f} (maker)",
+            is_maker=True,
+            category=quote.market.category,
         )
         if filled <= 0:
             return
