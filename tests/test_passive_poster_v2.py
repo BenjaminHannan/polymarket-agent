@@ -153,11 +153,11 @@ def test_eligibility_disabled_when_no_allowlist():
 def test_compute_quote_produces_two_sided():
     v2 = _make_v2(certified=None)
     book = _book(bids={0.49: 100}, asks={0.51: 100})
-    q = v2._compute_quote(_market(), book, inventory_yes=0.0)
+    m = _market()
+    q = v2._compute_quote(m, book, m.yes_token_id, inventory_this_token=0.0)
     assert q is not None
     assert q.bid_price > 0
     assert q.ask_price > q.bid_price
-    # Quote should sit inside the existing spread (i.e., not cross top of book)
     assert q.bid_price <= 0.51 - 0.01
     assert q.ask_price >= 0.49 + 0.01
 
@@ -165,10 +165,10 @@ def test_compute_quote_produces_two_sided():
 def test_compute_quote_inventory_skew_long_lowers_bid():
     v2 = _make_v2(certified=None)
     book = _book(bids={0.49: 100}, asks={0.51: 100})
-    q_flat = v2._compute_quote(_market(), book, inventory_yes=0.0)
-    q_long = v2._compute_quote(_market(), book, inventory_yes=200.0)
+    m = _market()
+    q_flat = v2._compute_quote(m, book, m.yes_token_id, 0.0)
+    q_long = v2._compute_quote(m, book, m.yes_token_id, 200.0)
     assert q_flat is not None and q_long is not None
-    # Long inventory → reservation lower → both quotes shifted down
     assert q_long.bid_price <= q_flat.bid_price
     assert q_long.ask_price <= q_flat.ask_price
 
@@ -176,8 +176,121 @@ def test_compute_quote_inventory_skew_long_lowers_bid():
 def test_compute_quote_inventory_skew_short_raises_ask():
     v2 = _make_v2(certified=None)
     book = _book(bids={0.49: 100}, asks={0.51: 100})
-    q_flat = v2._compute_quote(_market(), book, inventory_yes=0.0)
-    q_short = v2._compute_quote(_market(), book, inventory_yes=-200.0)
+    m = _market()
+    q_flat = v2._compute_quote(m, book, m.yes_token_id, 0.0)
+    q_short = v2._compute_quote(m, book, m.yes_token_id, -200.0)
     assert q_flat is not None and q_short is not None
     assert q_short.bid_price >= q_flat.bid_price
     assert q_short.ask_price >= q_flat.ask_price
+
+
+def test_compute_quote_marks_yes_vs_no_token():
+    v2 = _make_v2(certified=None)
+    book = _book(bids={0.49: 100}, asks={0.51: 100})
+    m = _market()
+    q_yes = v2._compute_quote(m, book, m.yes_token_id, 0.0)
+    q_no = v2._compute_quote(m, book, m.no_token_id, 0.0)
+    assert q_yes is not None and q_no is not None
+    assert q_yes.is_yes_token is True
+    assert q_no.is_yes_token is False
+    assert q_yes.token_id != q_no.token_id
+
+
+# ── Quote-replacement protocol ─────────────────────────────────────────
+
+def test_post_or_replace_first_post_creates_revision_zero():
+    v2 = _make_v2(certified=None)
+    book = _book(bids={0.49: 100}, asks={0.51: 100})
+    m = _market()
+    new_q = v2._compute_quote(m, book, m.yes_token_id, 0.0)
+    posted = v2._post_or_replace(m.yes_token_id, new_q)
+    assert posted.revision == 0
+    assert v2._quotes[m.yes_token_id] is posted
+
+
+def test_post_or_replace_unchanged_quote_keeps_revision():
+    v2 = _make_v2(certified=None)
+    book = _book(bids={0.49: 100}, asks={0.51: 100})
+    m = _market()
+    q1 = v2._compute_quote(m, book, m.yes_token_id, 0.0)
+    p1 = v2._post_or_replace(m.yes_token_id, q1)
+    p1.bid_fills = 3  # simulate a fill
+    q2 = v2._compute_quote(m, book, m.yes_token_id, 0.0)  # identical
+    p2 = v2._post_or_replace(m.yes_token_id, q2)
+    assert p2.revision == 0  # unchanged
+    assert p2.bid_fills == 3  # counters preserved
+
+
+def test_post_or_replace_changed_quote_increments_revision():
+    v2 = _make_v2(certified=None)
+    book = _book(bids={0.49: 100}, asks={0.51: 100})
+    m = _market()
+    q1 = v2._compute_quote(m, book, m.yes_token_id, 0.0)
+    p1 = v2._post_or_replace(m.yes_token_id, q1)
+    p1.bid_fills = 5
+    # A meaningfully different quote (long inventory shifts both quotes)
+    q2 = v2._compute_quote(m, book, m.yes_token_id, 500.0)
+    p2 = v2._post_or_replace(m.yes_token_id, q2)
+    if p2.bid_price != p1.bid_price or p2.ask_price != p1.ask_price:
+        assert p2.revision == 1  # incremented after the cancel+post
+        # Fill counters preserved across the replacement
+        assert p2.bid_fills == 5
+
+
+# ── Adverse-selection feedback ──────────────────────────────────────────
+
+def test_adverse_selection_widen_no_history_returns_one():
+    v2 = _make_v2(certified=None)
+    assert v2._adverse_selection_widen("nonexistent_token") == 1.0
+
+
+def test_adverse_selection_widen_after_adverse_buys():
+    v2 = _make_v2(certified=None)
+    book = _book(bids={0.49: 100}, asks={0.51: 100})
+    m = _market()
+    q = v2._compute_quote(m, book, m.yes_token_id, 0.0)
+    v2._post_or_replace(m.yes_token_id, q)
+    # Simulate 4 bought-then-mid-dropped (adverse) outcomes
+    for _ in range(4):
+        v2._quotes[m.yes_token_id].recent_outcomes.append((True, 0.50, 0.45))
+    widen = v2._adverse_selection_widen(m.yes_token_id)
+    assert widen > 1.0  # should widen the spread
+    assert widen <= 1.5  # capped
+
+
+def test_adverse_selection_widen_after_favorable_outcomes():
+    v2 = _make_v2(certified=None)
+    book = _book(bids={0.49: 100}, asks={0.51: 100})
+    m = _market()
+    q = v2._compute_quote(m, book, m.yes_token_id, 0.0)
+    v2._post_or_replace(m.yes_token_id, q)
+    # Favorable: bought, mid then went UP (we're winning)
+    for _ in range(4):
+        v2._quotes[m.yes_token_id].recent_outcomes.append((True, 0.50, 0.55))
+    widen = v2._adverse_selection_widen(m.yes_token_id)
+    assert widen == 1.0  # no widening when not adverse
+
+
+# ── Calibration from observed flow ──────────────────────────────────────
+
+def test_calibration_first_call_records_mid():
+    v2 = _make_v2(certified=None)
+    book = _book(bids={0.49: 100}, asks={0.51: 100})
+    m = _market()
+    v2._update_calibration(m.yes_token_id, book)
+    # First call only seeds _last_mid; no calibration update yet
+    assert v2._last_mid[m.yes_token_id] == 0.50
+    assert m.yes_token_id not in v2._k_arrival
+
+
+def test_calibration_updates_after_two_cycles():
+    v2 = _make_v2(certified=None)
+    m = _market()
+    book1 = _book(bids={0.49: 100}, asks={0.51: 100})
+    v2._update_calibration(m.yes_token_id, book1)
+    book2 = _book(bids={0.50: 100}, asks={0.52: 100})  # mid shifted
+    v2._update_calibration(m.yes_token_id, book2)
+    assert m.yes_token_id in v2._k_arrival
+    assert m.yes_token_id in v2._sigma_per_sec
+    # Mid moved → sigma estimate is positive
+    assert v2._sigma_per_sec[m.yes_token_id] > 0

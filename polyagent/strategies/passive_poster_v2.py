@@ -95,18 +95,42 @@ def avellaneda_stoikov_half_spread(
 
 @dataclass
 class MakerQuote:
-    """A two-sided quote currently posted on a token."""
+    """A two-sided quote currently posted on ONE token (either YES or NO).
+
+    The maker keeps independent quotes for the YES and NO tokens of each
+    market. They are not redundant: Polymarket's outcome tokens trade
+    in separate books with their own taker flow, so a fill on YES at
+    0.40 BUY does NOT imply a fill on NO at 0.60 SELL.
+    """
     market: Market
-    yes_token_id: str
-    no_token_id: str
-    bid_price: float        # what we'd post on the YES bid side
-    ask_price: float        # what we'd post on the YES ask side
-    quote_size: float       # share count per side
+    token_id: str           # the specific outcome token this quote covers
+    is_yes_token: bool      # True for YES, False for NO (used for inventory naming)
+    bid_price: float
+    ask_price: float
+    quote_size: float
     posted_ts: float = field(default_factory=time.time)
-    inventory_yes: float = 0.0  # +long, -short (we paper-post, so always 0 starting)
+    inventory: float = 0.0  # long position on THIS token
     cumulative_spread_captured: float = 0.0
     bid_fills: int = 0
     ask_fills: int = 0
+    # Adverse-selection tracking (last N (was_buy, mid_after) pairs)
+    recent_outcomes: list[tuple[bool, float, float]] = field(default_factory=list)
+    # Counter for the quote-replacement protocol (each cancel+repost increments)
+    revision: int = 0
+
+
+def _quote_changed(old: MakerQuote | None, new: MakerQuote, *, tol: float = 0.005) -> bool:
+    """Whether the desired quote differs enough from the active one to
+    justify a cancel + new post. Tolerance prevents churn on every cycle."""
+    if old is None:
+        return True
+    if abs(old.bid_price - new.bid_price) > tol:
+        return True
+    if abs(old.ask_price - new.ask_price) > tol:
+        return True
+    if abs(old.quote_size - new.quote_size) > tol * 100:
+        return True
+    return False
 
 
 @dataclass
@@ -138,6 +162,14 @@ class PassivePosterV2:
     # Per-token quote state
     _quotes: dict[str, MakerQuote] = field(default_factory=dict)
     _last_cycle_ts: dict[str, float] = field(default_factory=dict)
+    # AS calibration: per-token taker arrival rate estimate (Poisson). Updated
+    # from observed mid-tick changes + book updates as a proxy for taker flow.
+    _k_arrival: dict[str, float] = field(default_factory=dict)
+    # Per-token rolling counter of mid-changes since last calibration update
+    _midchanges_since: dict[str, list[float]] = field(default_factory=dict)
+    _last_mid: dict[str, float] = field(default_factory=dict)
+    # Realized vol estimate per token (per-second, EWMA)
+    _sigma_per_sec: dict[str, float] = field(default_factory=dict)
 
     def _eligible_market(self, m: Market, book: OrderBook | None) -> tuple[bool, str]:
         """Returns (eligible, reason)."""
@@ -170,8 +202,15 @@ class PassivePosterV2:
         return True, "ok"
 
     def _compute_quote(
-        self, m: Market, book: OrderBook, inventory_yes: float
+        self, m: Market, book: OrderBook, token_id: str, inventory_this_token: float,
+        *, k_arrival_per_sec: float | None = None,
     ) -> MakerQuote | None:
+        """Compute a two-sided quote for ONE token (YES or NO).
+
+        Each token has its own book + own inventory. NO is not derived
+        from YES — they have independent flow on Polymarket and we quote
+        each independently (per pmwhy.md B1).
+        """
         bb = book.best_bid()
         ba = book.best_ask()
         if bb is None or ba is None:
@@ -180,11 +219,13 @@ class PassivePosterV2:
         rv = book.realized_vol(300) if hasattr(book, "realized_vol") else None
         sigma = rv if (rv and rv > 0) else 0.005
         sigma_sq_per_sec = sigma * sigma
-        # Estimate taker arrival rate from recent book churn (ofi as proxy);
-        # fall back to a typical 0.5/sec assumption for low-vol markets.
-        k = 0.5
+        # Per-token taker arrival rate (calibrated upstream; default 0.5/s).
+        k = k_arrival_per_sec if (k_arrival_per_sec and k_arrival_per_sec > 0) else 0.5
+        # Per-token adverse-selection penalty: widen θ when recent fills
+        # on this token preceded adverse mid moves.
+        as_widen = self._adverse_selection_widen(token_id)
         skew = avellaneda_stoikov_skew(
-            inventory=inventory_yes,
+            inventory=inventory_this_token,
             gamma=self.gamma,
             sigma_sq_per_sec=sigma_sq_per_sec,
             time_to_horizon_sec=self.horizon_sec,
@@ -194,23 +235,126 @@ class PassivePosterV2:
             sigma_sq_per_sec=sigma_sq_per_sec,
             time_to_horizon_sec=self.horizon_sec,
             k_arrival_per_sec=k,
-        )
+        ) * as_widen
         reservation = mid + skew
-        # Don't quote inside the existing spread by less than 1 tick
         TICK = 0.01
-        bid_price = max(0.0, min(reservation - half_spread, ba[0] - TICK))
-        ask_price = max(reservation + half_spread, bb[0] + TICK)
+        # Polymarket prices are bounded to [0.01, 0.99] — hard clamp.
+        # A quote at 0.0 or 1.0 would never fill and is a sign that
+        # the AS skew + half-spread pushed off-axis (e.g., very deep
+        # favorites). When clamps engage, we still post but the quote
+        # becomes the boundary tick.
+        MIN_PRICE = 0.01
+        MAX_PRICE = 0.99
+        bid_price = max(MIN_PRICE, min(reservation - half_spread, ba[0] - TICK))
+        ask_price = min(MAX_PRICE, max(reservation + half_spread, bb[0] + TICK))
         if ask_price <= bid_price:
-            return None  # collapsed
+            return None
+        is_yes = (token_id == m.yes_token_id)
         return MakerQuote(
             market=m,
-            yes_token_id=m.yes_token_id,
-            no_token_id=m.no_token_id,
+            token_id=token_id,
+            is_yes_token=is_yes,
             bid_price=round(bid_price, 4),
             ask_price=round(ask_price, 4),
             quote_size=self.quote_size,
-            inventory_yes=inventory_yes,
+            inventory=inventory_this_token,
         )
+
+    # ── Quote-replacement protocol ─────────────────────────────────────
+    # In paper-mode there's no real cancel/post round-trip; in real-money
+    # mode each replacement is a CLOB cancel + new post. The protocol
+    # here matches what the live broker would do so we can swap broker
+    # backends cleanly later: (1) compare desired vs active quote, (2) if
+    # changed by more than `tol`, log a "cancel" event for the active
+    # quote and a "post" event for the new one, (3) bump revision.
+    def _post_or_replace(self, token_id: str, new_q: MakerQuote) -> MakerQuote:
+        old = self._quotes.get(token_id)
+        if not _quote_changed(old, new_q):
+            # Inherit identity + counters from the existing active quote
+            new_q.revision = old.revision
+            new_q.bid_fills = old.bid_fills
+            new_q.ask_fills = old.ask_fills
+            new_q.recent_outcomes = old.recent_outcomes
+            new_q.cumulative_spread_captured = old.cumulative_spread_captured
+            self._quotes[token_id] = new_q
+            return new_q
+        if old is not None:
+            log.info(
+                "passive_v2_cancel",
+                token=token_id[:14], rev=old.revision,
+                old_bid=old.bid_price, old_ask=old.ask_price,
+            )
+            new_q.revision = old.revision + 1
+            new_q.bid_fills = old.bid_fills
+            new_q.ask_fills = old.ask_fills
+            new_q.recent_outcomes = old.recent_outcomes
+            new_q.cumulative_spread_captured = old.cumulative_spread_captured
+        else:
+            new_q.revision = 0
+        log.info(
+            "passive_v2_post",
+            token=token_id[:14], rev=new_q.revision,
+            bid=new_q.bid_price, ask=new_q.ask_price, size=new_q.quote_size,
+        )
+        self._quotes[token_id] = new_q
+        return new_q
+
+    def _update_calibration(self, token_id: str, book: OrderBook) -> None:
+        """Update per-token estimates of taker arrival rate (k) and
+        realized vol (σ) from observed mid changes. Uses a simple
+        rolling-window approach: each cycle we record the mid-change
+        magnitude and time delta; k is approximated by the rate of
+        non-zero mid changes per second; σ is the EWMA of |Δmid|.
+
+        These are noisy on a single-cycle basis, so we EWMA-smooth.
+        """
+        cur_mid = book.mid()
+        if cur_mid is None:
+            return
+        prev_mid = self._last_mid.get(token_id)
+        self._last_mid[token_id] = cur_mid
+        if prev_mid is None:
+            return
+        d_mid = abs(cur_mid - prev_mid)
+        # EWMA on σ_per_sec — assume cycle ≈ poll_sec apart
+        prev_sigma = self._sigma_per_sec.get(token_id, 0.005)
+        sample_sigma = d_mid / max(self.poll_sec, 1.0)
+        new_sigma = 0.9 * prev_sigma + 0.1 * sample_sigma
+        self._sigma_per_sec[token_id] = max(1e-5, new_sigma)
+        # Maintain a deque of recent mid-change samples; rate of nonzero
+        # samples per second approximates k. Keep last 20 samples.
+        window = self._midchanges_since.setdefault(token_id, [])
+        window.append(d_mid)
+        if len(window) > 20:
+            del window[0]
+        # k ≈ (nonzero / total) / poll_sec — i.e. how often the mid
+        # actually moves divided by the polling cadence.
+        nonzero = sum(1 for x in window if x > 1e-9)
+        k = nonzero / max(len(window), 1) / max(self.poll_sec, 1.0)
+        # Floor / ceil to plausible range
+        self._k_arrival[token_id] = max(0.05, min(5.0, k))
+
+    def _adverse_selection_widen(self, token_id: str) -> float:
+        """Return a multiplier on half-spread that widens after recent
+        adverse fills on this token. 1.0 = neutral; 1.5+ = widened.
+
+        Heuristic: of the last N fills on this token, fraction that
+        preceded a mid-move against us within `as_lookback_sec`.
+        """
+        old = self._quotes.get(token_id)
+        if old is None or not old.recent_outcomes:
+            return 1.0
+        # recent_outcomes entries are (was_buy, mid_at_fill, mid_after)
+        adverse = 0
+        for was_buy, mid_at, mid_after in old.recent_outcomes[-10:]:
+            if was_buy and mid_after < mid_at:    # bought, mid dropped → bad
+                adverse += 1
+            elif not was_buy and mid_after > mid_at:  # sold, mid rose → bad
+                adverse += 1
+        n = min(10, len(old.recent_outcomes))
+        adverse_rate = adverse / max(n, 1)
+        # Linear widening: 0% adverse → 1.0, 50% → 1.25, 100% → 1.5
+        return 1.0 + 0.5 * adverse_rate
 
     async def _draw_passive_fill(
         self,
@@ -240,21 +384,17 @@ class PassivePosterV2:
         self,
         quote: MakerQuote,
         side: str,
-        token_id: str,
         post_price: float,
+        book: OrderBook,
     ) -> None:
-        """Route the virtual fill through the broker so it lands in fills /
-        fills_shadow / fills_shadow_queue and shows up on the dashboard."""
-        # Maker fills get the post price by definition (no spread crossed).
-        # Estimate rebate as a positive ledger entry (paper-only — real bot
-        # would receive USDC rebates daily).
-        # We approximate the captured-spread component as half the visible
-        # spread at the time of post; the rebate is rebate_share_of_fee of
-        # that.
+        """Route the virtual fill through the broker. The broker handles
+        fee/rebate/cancel-latency accounting; we track inventory + the
+        adverse-selection outcomes for the quote."""
+        mid_at_fill = book.mid()
         filled = await self.broker.submit(
             strategy=self.strategy_name,
             condition_id=quote.market.condition_id,
-            token_id=token_id,
+            token_id=quote.token_id,
             side=side,
             max_size=quote.quote_size,
             max_price=post_price + 1e-9 if side == "BUY" else post_price - 1e-9,
@@ -266,56 +406,107 @@ class PassivePosterV2:
             return
         if side == "BUY":
             quote.bid_fills += 1
-            quote.inventory_yes += filled
+            quote.inventory += filled
         else:
             quote.ask_fills += 1
-            quote.inventory_yes -= filled
-        # Spread captured proxy: half-spread × filled
-        # (the rebate is bookkeeping only in paper mode)
+            quote.inventory -= filled
+        # Record an "outcome pending" entry for adverse-selection tracking.
+        # The mid at fill time is recorded; the mid_after is filled in by
+        # the post-fill check on the next cycle.
+        quote.recent_outcomes.append((side == "BUY", mid_at_fill or post_price, mid_at_fill or post_price))
+        # Trim to keep memory bounded
+        if len(quote.recent_outcomes) > 30:
+            quote.recent_outcomes = quote.recent_outcomes[-30:]
         log.info(
             "passive_v2_fill",
             condition_id=quote.market.condition_id,
+            token=quote.token_id[:14],
+            yes_token=quote.is_yes_token,
             side=side,
             price=round(post_price, 4),
             size=round(filled, 2),
-            inventory_yes_after=round(quote.inventory_yes, 2),
+            inventory_after=round(quote.inventory, 2),
         )
 
-    async def _cycle_token(self, token_id: str) -> None:
-        m = self.markets_by_token.get(token_id)
-        if m is None:
+    def _update_adverse_selection_outcomes(
+        self, token_id: str, current_mid: float | None
+    ) -> None:
+        """Walk the active quote's recent_outcomes; for any entry whose
+        mid_after still equals mid_at, update it with the current mid
+        — this is the "where did the price actually go after our fill"
+        feedback that drives the AS widening multiplier."""
+        if current_mid is None:
             return
+        q = self._quotes.get(token_id)
+        if q is None or not q.recent_outcomes:
+            return
+        updated = []
+        for was_buy, mid_at, mid_after in q.recent_outcomes:
+            # If we haven't filled in a real "after" yet (still same as at),
+            # use the current mid as the after-mid sample.
+            if abs(mid_after - mid_at) < 1e-9:
+                updated.append((was_buy, mid_at, current_mid))
+            else:
+                updated.append((was_buy, mid_at, mid_after))
+        q.recent_outcomes = updated
+
+    async def _cycle_one_token(self, m: Market, token_id: str) -> None:
+        """Run one quote cycle for a single token (either YES or NO)."""
         book = self.book_store.books.get(token_id)
         ok, reason = self._eligible_market(m, book)
         if not ok:
-            self._quotes.pop(token_id, None)
+            # If this token is no longer eligible, cancel any active quote
+            if token_id in self._quotes:
+                old = self._quotes.pop(token_id)
+                log.info("passive_v2_cancel", token=token_id[:14],
+                         rev=old.revision, reason=f"ineligible:{reason}")
             return
 
-        # Per-token cooldown after fills to avoid runaway adverse selection
         last = self._last_cycle_ts.get(token_id, 0.0)
         if time.time() - last < self.cooldown_sec:
             return
 
-        # Existing inventory on this YES token from prior fills + other strategies
-        pos_yes = self.broker.positions.get(m.yes_token_id)
-        inv_yes = pos_yes.size if pos_yes else 0.0
-        if abs(inv_yes) >= self.max_total_inventory_yes:
-            log.info("passive_v2_skip_inventory_cap", token=token_id[:14], inv=inv_yes)
+        # Update calibration (taker arrival rate, σ) from observed mid
+        # changes since the last cycle.
+        self._update_calibration(token_id, book)
+
+        # Update adverse-selection feedback (mid_after on prior fills) BEFORE
+        # we recompute, so the new quote uses up-to-date AS state.
+        cur_mid = book.mid()
+        self._update_adverse_selection_outcomes(token_id, cur_mid)
+
+        pos = self.broker.positions.get(token_id)
+        inv = pos.size if pos else 0.0
+        if abs(inv) >= self.max_total_inventory_yes:
+            log.info("passive_v2_skip_inventory_cap", token=token_id[:14], inv=inv)
             return
 
-        quote = self._compute_quote(m, book, inv_yes)
-        if quote is None:
-            return
-        self._quotes[token_id] = quote
+        # Calibrated taker arrival rate from observed flow on this token
+        k_est = self._k_arrival.get(token_id)
 
-        # Try a virtual fill on each side
+        new_q = self._compute_quote(m, book, token_id, inv, k_arrival_per_sec=k_est)
+        if new_q is None:
+            return
+        quote = self._post_or_replace(token_id, new_q)
+
+        # Try virtual fills on each side
         if await self._draw_passive_fill(quote, book, "BUY", quote.bid_price):
-            await self._record_fill(quote, "BUY", quote.yes_token_id, quote.bid_price)
+            await self._record_fill(quote, "BUY", quote.bid_price, book)
         if await self._draw_passive_fill(quote, book, "SELL", quote.ask_price):
-            # SELL closing the YES side. Only attempt if we have inventory.
-            if inv_yes > 0:
-                await self._record_fill(quote, "SELL", quote.yes_token_id, quote.ask_price)
+            if inv > 0:
+                await self._record_fill(quote, "SELL", quote.ask_price, book)
         self._last_cycle_ts[token_id] = time.time()
+
+    async def _cycle_token(self, token_id: str) -> None:
+        """Backwards-compat shim: iterate both YES and NO sides of the
+        market this token belongs to, so each cycle quotes both outcomes."""
+        m = self.markets_by_token.get(token_id)
+        if m is None:
+            return
+        # Quote on YES side
+        await self._cycle_one_token(m, m.yes_token_id)
+        # Quote on NO side (independent inventory + book)
+        await self._cycle_one_token(m, m.no_token_id)
 
     async def run(self) -> None:
         if not self.target_tokens:
