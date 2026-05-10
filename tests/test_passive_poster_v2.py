@@ -294,3 +294,59 @@ def test_calibration_updates_after_two_cycles():
     assert m.yes_token_id in v2._sigma_per_sec
     # Mid moved → sigma estimate is positive
     assert v2._sigma_per_sec[m.yes_token_id] > 0
+
+
+# ── Inventory unwind ──────────────────────────────────────────────────
+
+def test_inventory_unwind_long_suppresses_buy_side():
+    v2 = _make_v2(certified=None)
+    v2.max_total_inventory_yes = 100
+    v2.unwind_threshold_pct = 0.6  # threshold = 60
+    book = _book(bids={0.49: 100}, asks={0.51: 100})
+    m = _market()
+    # 80 long > threshold 60 → unwind mode
+    q = v2._compute_quote(m, book, m.yes_token_id, inventory_this_token=80.0)
+    assert q is not None
+    assert q.one_sided_unwind is True
+    assert q.unwind_side == "BUY"
+    assert q.bid_price == 0.01  # boundary tick — unfillable
+
+
+def test_inventory_unwind_short_suppresses_sell_side():
+    v2 = _make_v2(certified=None)
+    v2.max_total_inventory_yes = 100
+    v2.unwind_threshold_pct = 0.6
+    book = _book(bids={0.49: 100}, asks={0.51: 100})
+    m = _market()
+    # -80 short → unwind mode, suppress SELL
+    q = v2._compute_quote(m, book, m.yes_token_id, inventory_this_token=-80.0)
+    assert q is not None
+    assert q.one_sided_unwind is True
+    assert q.unwind_side == "SELL"
+    assert q.ask_price == 0.99
+
+
+def test_inventory_below_threshold_normal_two_sided():
+    v2 = _make_v2(certified=None)
+    v2.max_total_inventory_yes = 100
+    v2.unwind_threshold_pct = 0.6
+    book = _book(bids={0.49: 100}, asks={0.51: 100})
+    m = _market()
+    q = v2._compute_quote(m, book, m.yes_token_id, inventory_this_token=30.0)
+    assert q is not None
+    assert q.one_sided_unwind is False
+    assert q.unwind_side is None
+    # Both quotes should sit in the normal range
+    assert 0.01 < q.bid_price < q.ask_price < 0.99
+
+
+# ── Stale-quote tracking ──────────────────────────────────────────────
+
+def test_compute_quote_records_mid_at_post():
+    v2 = _make_v2(certified=None)
+    book = _book(bids={0.49: 100}, asks={0.51: 100})
+    m = _market()
+    q = v2._compute_quote(m, book, m.yes_token_id, 0.0)
+    assert q is not None
+    # mid was (0.49 + 0.51) / 2 = 0.50
+    assert q.mid_at_post == 0.50

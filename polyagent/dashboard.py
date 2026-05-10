@@ -490,6 +490,34 @@ class Dashboard:
     async def api_failures(self, request: web.Request) -> web.Response:
         return web.json_response(self._failures())
 
+    async def api_round_trips(self, request: web.Request) -> web.Response:
+        """Round-trip P&L summary by strategy + recent closed round-trips."""
+        try:
+            conn = _read_only_conn(self.db_path)
+            # Per-strategy summaries
+            strategies = [r[0] for r in conn.execute(
+                "SELECT DISTINCT strategy FROM round_trip_legs"
+            )]
+            from polyagent.risk.round_trips import strategy_summary
+            per_strategy = [strategy_summary(conn, s) for s in strategies]
+            recent = [
+                dict(r) for r in conn.execute(
+                    """SELECT strategy, token_id, condition_id, open_ts,
+                              close_ts, size, open_price, close_price,
+                              gross_pnl, net_pnl
+                       FROM round_trip_legs
+                       WHERE close_ts IS NOT NULL
+                       ORDER BY close_ts DESC LIMIT 25"""
+                )
+            ]
+            conn.close()
+        except Exception as e:
+            log.warning("dashboard_round_trips_query_error", err=str(e))
+            return web.json_response({"per_strategy": [], "recent": []})
+        for r in recent:
+            r["close_iso"] = time.strftime("%Y-%m-%d %H:%M", time.gmtime(r.get("close_ts") or 0))
+        return web.json_response({"per_strategy": per_strategy, "recent": recent})
+
     def _failures(self) -> dict:
         """Aggregate model_failures: counts by type, by category, recent rows."""
         try:
@@ -627,6 +655,7 @@ class Dashboard:
         app.router.add_get("/api/certificates", self.api_certificates)
         app.router.add_get("/api/by-category", self.api_by_category)
         app.router.add_get("/api/failures", self.api_failures)
+        app.router.add_get("/api/round-trips", self.api_round_trips)
         runner = web.AppRunner(app)
         await runner.setup()
         site = web.TCPSite(runner, "127.0.0.1", self.port)

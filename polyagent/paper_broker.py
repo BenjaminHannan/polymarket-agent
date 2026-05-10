@@ -174,6 +174,18 @@ class PaperBroker:
         await self.db.commit()
         await self._migrate_nav_history()
         await self._migrate_fills_shadow_queue()
+        # Eagerly create the round_trip_legs table so dashboard queries
+        # can target it before the first fill lands.
+        try:
+            import sqlite3 as _sql
+            from polyagent.risk.round_trips import ensure_table as _rt_ensure
+            _c = _sql.connect(settings.db_path)
+            try:
+                _rt_ensure(_c)
+            finally:
+                _c.close()
+        except Exception as e:
+            log.warning("round_trip_table_init_failed", err=str(e))
         await self._recover_state()
 
     async def _migrate_fills_shadow_queue(self) -> None:
@@ -686,6 +698,35 @@ class PaperBroker:
                     self.cash -= fees.taker_fee_paid
                 if fees.maker_rebate_credited > 0:
                     self.cash += fees.maker_rebate_credited
+                # Round-trip P&L attribution: pair this fill against
+                # earlier opposite-side fills via FIFO matching. Lets us
+                # measure realized round-trip P&L per strategy without
+                # waiting for market resolution.
+                try:
+                    from polyagent.risk.round_trips import FillContext, record_fill
+                    rt_ctx = FillContext(
+                        fill_id=fill_id,
+                        strategy=strategy,
+                        condition_id=condition_id,
+                        token_id=token_id,
+                        side=side,
+                        price=eff_price,
+                        size=size,
+                        ts=ts,
+                        fees_paid=fees.taker_fee_paid,
+                        rebate_credited=fees.maker_rebate_credited,
+                    )
+                    # Reuse the same aiosqlite db handle by calling its
+                    # underlying sync API (round_trips uses sync sqlite).
+                    # Easier path: open a short-lived sync connection.
+                    import sqlite3 as _sql
+                    rt_conn = _sql.connect(settings.db_path, timeout=10.0)
+                    try:
+                        record_fill(rt_conn, rt_ctx)
+                    finally:
+                        rt_conn.close()
+                except Exception as e:
+                    log.warning("round_trip_record_failed", err=str(e))
             except Exception as e:
                 log.warning("queue_shadow_write_failed", err=str(e))
             await self.db.commit()

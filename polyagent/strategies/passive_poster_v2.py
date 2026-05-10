@@ -113,10 +113,16 @@ class MakerQuote:
     cumulative_spread_captured: float = 0.0
     bid_fills: int = 0
     ask_fills: int = 0
-    # Adverse-selection tracking (last N (was_buy, mid_after) pairs)
+    # Adverse-selection tracking (last N (was_buy, mid_at_fill, mid_after) tuples)
     recent_outcomes: list[tuple[bool, float, float]] = field(default_factory=list)
     # Counter for the quote-replacement protocol (each cancel+repost increments)
     revision: int = 0
+    # Mid at the moment we posted — used for stale-quote detection.
+    mid_at_post: float = 0.0
+    # Inventory-unwind state: True when inventory exceeds unwind_threshold
+    # and we've suppressed the inventory-adding side.
+    one_sided_unwind: bool = False
+    unwind_side: str | None = None  # "BUY" (suppress BUY) or "SELL" (suppress SELL)
 
 
 def _quote_changed(old: MakerQuote | None, new: MakerQuote, *, tol: float = 0.005) -> bool:
@@ -155,6 +161,13 @@ class PassivePosterV2:
     cooldown_sec: float = 60.0
     # Maker rebate assumption (Polymarket: 20-25% of taker fees per market)
     rebate_share_of_fee: float = 0.22
+    # Inventory-unwind threshold (fraction of max_total_inventory_yes).
+    # Above this, we suppress the inventory-adding side and tighten the
+    # reducing side until inventory comes back below the threshold.
+    unwind_threshold_pct: float = 0.6
+    # Stale-quote cancel: if mid moves more than this many ticks since
+    # post, force a cancel + recompute even if cooldown hasn't elapsed.
+    stale_mid_ticks: float = 2.0
     # Cert allowlist (built from strategy_certificates)
     certified_categories: set[str] | None = None
     # Strategy name for logs / fills.strategy
@@ -250,6 +263,28 @@ class PassivePosterV2:
         if ask_price <= bid_price:
             return None
         is_yes = (token_id == m.yes_token_id)
+        # Inventory unwind: when |inventory| exceeds unwind_threshold ×
+        # max_total_inventory_yes, switch to one-sided mode that
+        # suppresses the inventory-adding side and tightens the
+        # reducing side. Long → suppress BUY (we'd add YES), tighten SELL.
+        # Short → suppress SELL, tighten BUY.
+        unwind_thr = self.unwind_threshold_pct * self.max_total_inventory_yes
+        one_sided = abs(inventory_this_token) >= unwind_thr
+        unwind_side: str | None = None
+        if one_sided:
+            if inventory_this_token > 0:
+                # Long → suppress BUY (post bid at floor that won't fill),
+                # tighten SELL by halving the half-spread on that side
+                unwind_side = "BUY"
+                bid_price = MIN_PRICE  # effectively unfillable
+                # Tighten ask: post 1 tick inside the existing best_ask
+                ask_price = max(MIN_PRICE + TICK, ba[0] - TICK)
+            else:
+                unwind_side = "SELL"
+                ask_price = MAX_PRICE
+                bid_price = min(MAX_PRICE - TICK, bb[0] + TICK)
+            if ask_price <= bid_price:
+                return None
         return MakerQuote(
             market=m,
             token_id=token_id,
@@ -258,6 +293,9 @@ class PassivePosterV2:
             ask_price=round(ask_price, 4),
             quote_size=self.quote_size,
             inventory=inventory_this_token,
+            mid_at_post=mid,
+            one_sided_unwind=one_sided,
+            unwind_side=unwind_side,
         )
 
     # ── Quote-replacement protocol ─────────────────────────────────────
@@ -462,9 +500,32 @@ class PassivePosterV2:
                          rev=old.revision, reason=f"ineligible:{reason}")
             return
 
-        last = self._last_cycle_ts.get(token_id, 0.0)
-        if time.time() - last < self.cooldown_sec:
-            return
+        cur_mid = book.mid()
+
+        # Stale-quote cancel: if mid has moved >= stale_mid_ticks ticks
+        # since we posted, bypass the cooldown and recompute now. This
+        # is the "if mid moves through us, cancel before we get picked
+        # off" protection that paper-mode owes a real maker.
+        active = self._quotes.get(token_id)
+        bypass_cooldown = False
+        if active is not None and active.mid_at_post and cur_mid is not None:
+            mid_delta_ticks = abs(cur_mid - active.mid_at_post) / 0.01
+            if mid_delta_ticks >= self.stale_mid_ticks:
+                log.info(
+                    "passive_v2_cancel",
+                    token=token_id[:14], rev=active.revision,
+                    reason=f"stale_mid:{mid_delta_ticks:.1f}_ticks",
+                    mid_at_post=round(active.mid_at_post, 4),
+                    cur_mid=round(cur_mid, 4),
+                )
+                self._quotes.pop(token_id, None)
+                active = None
+                bypass_cooldown = True
+
+        if not bypass_cooldown:
+            last = self._last_cycle_ts.get(token_id, 0.0)
+            if time.time() - last < self.cooldown_sec:
+                return
 
         # Update calibration (taker arrival rate, σ) from observed mid
         # changes since the last cycle.
@@ -472,7 +533,6 @@ class PassivePosterV2:
 
         # Update adverse-selection feedback (mid_after on prior fills) BEFORE
         # we recompute, so the new quote uses up-to-date AS state.
-        cur_mid = book.mid()
         self._update_adverse_selection_outcomes(token_id, cur_mid)
 
         pos = self.broker.positions.get(token_id)
@@ -489,12 +549,16 @@ class PassivePosterV2:
             return
         quote = self._post_or_replace(token_id, new_q)
 
-        # Try virtual fills on each side
-        if await self._draw_passive_fill(quote, book, "BUY", quote.bid_price):
-            await self._record_fill(quote, "BUY", quote.bid_price, book)
-        if await self._draw_passive_fill(quote, book, "SELL", quote.ask_price):
-            if inv > 0:
-                await self._record_fill(quote, "SELL", quote.ask_price, book)
+        # Try virtual fills on each side, but skip the side suppressed
+        # by the inventory-unwind logic (its quote is at the boundary
+        # tick and effectively unfillable).
+        if quote.unwind_side != "BUY":
+            if await self._draw_passive_fill(quote, book, "BUY", quote.bid_price):
+                await self._record_fill(quote, "BUY", quote.bid_price, book)
+        if quote.unwind_side != "SELL":
+            if await self._draw_passive_fill(quote, book, "SELL", quote.ask_price):
+                if inv > 0:
+                    await self._record_fill(quote, "SELL", quote.ask_price, book)
         self._last_cycle_ts[token_id] = time.time()
 
     async def _cycle_token(self, token_id: str) -> None:
