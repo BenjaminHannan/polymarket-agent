@@ -143,6 +143,27 @@ class PaperBroker:
                 slippage_estimate REAL
             );
             CREATE INDEX IF NOT EXISTS fills_shadow_fid ON fills_shadow(fill_id);
+
+            -- Queue-aware shadow ledger (pmwhy.md §B2). Each fill is
+            -- re-priced under three honest models so we can compare
+            -- cumulative slippage by strategy: top-of-book optimistic
+            -- (what fills_shadow.vwap_price already records), the
+            -- multi-level walked-VWAP, and the closed-form
+            -- pessimistic with cancel-latency drift from queue_model.
+            -- The slippage_bps_walked column is the key metric for
+            -- re-validating certs under realistic taker fills.
+            CREATE TABLE IF NOT EXISTS fills_shadow_queue (
+                fill_id INTEGER PRIMARY KEY,
+                top_of_book_price REAL,
+                walked_vwap_price REAL,
+                pessimistic_price REAL,
+                size REAL,
+                levels_walked INTEGER,
+                partial INTEGER,
+                slippage_bps_walked REAL,
+                slippage_bps_pess REAL
+            );
+            CREATE INDEX IF NOT EXISTS fills_shadow_queue_fid ON fills_shadow_queue(fill_id);
             """
         )
         await self.db.commit()
@@ -541,6 +562,34 @@ class PaperBroker:
                 "INSERT INTO fills_shadow(fill_id, vwap_price, pessimistic_price, half_spread, size, slippage_estimate) VALUES (?,?,?,?,?,?)",
                 (fill_id, price, pessimistic_price, half_spread, size, slippage),
             )
+            # Queue-aware shadow ledger (pmwhy.md §B2): re-walk the book
+            # honestly to record what the multi-level VWAP would have
+            # been at this moment, alongside the closed-form pessimistic.
+            # This lets us re-validate certs under realistic taker fills.
+            try:
+                from polyagent.risk.queue_aware_fills import compare_fill_models
+                cmp = compare_fill_models(book, side, size)
+                if cmp.get("available"):
+                    await self.db.execute(
+                        """INSERT INTO fills_shadow_queue
+                           (fill_id, top_of_book_price, walked_vwap_price,
+                            pessimistic_price, size, levels_walked, partial,
+                            slippage_bps_walked, slippage_bps_pess)
+                           VALUES (?,?,?,?,?,?,?,?,?)""",
+                        (
+                            fill_id,
+                            cmp["top_of_book"],
+                            cmp["walked_vwap"],
+                            cmp["pessimistic"],
+                            cmp["filled_size"],
+                            cmp["levels_walked"],
+                            int(bool(cmp["partial"])),
+                            cmp["slippage_bps_walked"],
+                            cmp["slippage_bps_pess"],
+                        ),
+                    )
+            except Exception as e:
+                log.warning("queue_shadow_write_failed", err=str(e))
             await self.db.commit()
 
         log.info(
