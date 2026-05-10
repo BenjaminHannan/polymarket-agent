@@ -1,16 +1,22 @@
-"""Smart-money registry via Polymarket's public Goldsky subgraph.
+"""Smart-money registry — top-volume wallet detection.
 
-Builds a rolling registry of high-PnL maker wallets (top-K by realized
-profit over the last 30 days). Used by adverse-selection: when a known
-smart-money wallet is on the OTHER side of one of our proposed trades,
-we either skip the trade or post deeper inside the spread.
+Builds a rolling registry of high-volume maker/taker wallets (top-K by
+USDC notional traded over the last 30 days). Used by adverse-selection:
+when a known smart-money wallet is on the OTHER side of one of our
+proposed trades, we either skip the trade or post deeper inside the spread.
 
 Solidus Labs (April 2026): 0.55% of profitable maker wallets capture
 50% of maker gains. Detecting that small set of wallets and avoiding
 trades against them is the doc-cited adverse-selection edge.
 
-Endpoint: Goldsky's public Polymarket subgraph (no auth required for
-free tier). Falls back gracefully if the endpoint is unreachable.
+Primary source: the local `historical_trades` table populated by
+scripts/backfill_polymarket_trades (which queries
+data-api.polymarket.com/trades). Computes top-K wallets by total
+USDC volume over a rolling window.
+
+Fallback: the legacy Goldsky subgraph (URL is stale as of 2026; the
+fallback exists so the registry doesn't error out when
+historical_trades is empty).
 """
 
 from __future__ import annotations
@@ -79,9 +85,36 @@ class SmartMoneyRegistry:
     async def refresh(self) -> dict:
         if not self.enabled:
             return {"skipped": True}
-        # Goldsky GraphQL query to find top-N profitable wallets (this is a
-        # best-effort schema; the public subgraph schema can drift, in which
-        # case this falls back to no-op).
+        # Primary path: compute top-K from the historical_trades table
+        # (populated by scripts/backfill_polymarket_trades). Falls back
+        # to the legacy Goldsky path if the trades table is empty (e.g.,
+        # backfill hasn't run yet).
+        try:
+            from polyagent.data.polymarket_trades import top_volume_wallets
+            wallets = top_volume_wallets(
+                settings.db_path,
+                days=30,
+                top_k=self.top_k,
+                min_usdc_volume=self.min_profit_usd,
+            )
+            if wallets:
+                self.smart_wallets = {w["wallet"].lower() for w in wallets}
+                self.last_refresh_ts = time.time()
+                self._failed_attempts = 0
+                self.save()
+                log.info(
+                    "smart_money_refresh",
+                    n_wallets=len(self.smart_wallets),
+                    source="historical_trades",
+                    top_k=self.top_k,
+                )
+                return {"ok": True, "n_wallets": len(self.smart_wallets), "source": "historical_trades"}
+        except Exception as e:
+            log.warning("smart_money_local_query_error", err=str(e))
+
+        # Fallback: legacy Goldsky subgraph (URL is stale; this path is
+        # mostly a no-op now, kept so the registry doesn't error out
+        # when historical_trades is empty).
         query = """
         query TopWallets($limit: Int!) {
           users(first: $limit, orderBy: profit, orderDirection: desc) {
@@ -100,7 +133,7 @@ class SmartMoneyRegistry:
                     if r.status != 200:
                         self._failed_attempts += 1
                         log.warning("smart_money_http", status=r.status, attempts=self._failed_attempts)
-                        return {"ok": False, "status": r.status}
+                        return {"ok": False, "status": r.status, "source": "subgraph_fallback"}
                     data = await r.json()
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             self._failed_attempts += 1
@@ -124,8 +157,8 @@ class SmartMoneyRegistry:
         self.last_refresh_ts = time.time()
         self._failed_attempts = 0
         self.save()
-        log.info("smart_money_refresh", n_wallets=len(self.smart_wallets), top_k=self.top_k)
-        return {"ok": True, "n_wallets": len(self.smart_wallets)}
+        log.info("smart_money_refresh", n_wallets=len(self.smart_wallets), source="subgraph")
+        return {"ok": True, "n_wallets": len(self.smart_wallets), "source": "subgraph"}
 
     async def run(self) -> None:
         log.info("smart_money_start", refresh_sec=self.refresh_sec, top_k=self.top_k)
