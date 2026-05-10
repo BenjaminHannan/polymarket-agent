@@ -15,9 +15,13 @@ class Settings:
     clob_url: str = "https://clob.polymarket.com"
     market_ws_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 
-    # Storage
-    db_path: str = str(ROOT / "data" / "paper.db")
-    log_path: str = str(ROOT / "data" / "polyagent.log")
+    # Storage. DB_PATH / LOG_PATH env overrides let the bot run from a
+    # git worktree (or any cwd) while still reading/writing the canonical
+    # paper.db at the main repo root. Without the override, paths resolve
+    # relative to the polyagent package's parent — fine for production,
+    # but creates a fresh empty DB when launched from a worktree.
+    db_path: str = os.getenv("DB_PATH", str(ROOT / "data" / "paper.db"))
+    log_path: str = os.getenv("LOG_PATH", str(ROOT / "data" / "polyagent.log"))
 
     # Paper-trading sizing
     starting_nav: float = float(os.getenv("STARTING_NAV", "10000"))
@@ -83,6 +87,12 @@ class Settings:
 
     # Combined-signal paper trader
     enable_combined_trader: bool = os.getenv("ENABLE_COMBINED_TRADER", "1") == "1"
+    # Certificate gate: when "1", CombinedTrader only fires on categories that
+    # have an enabled=1 row in `strategy_certificates`. The allowlist is built
+    # at startup from `detail.category` of each enabled cert. Default OFF so
+    # existing deployments keep current behaviour; opt in to restrict trading
+    # to the slices that have actually passed CPCV/DSR validation.
+    enable_certificate_gate: bool = os.getenv("ENABLE_CERTIFICATE_GATE", "0") == "1"
     # Halved Kelly + halved per-trade cap after diagnostic showed 22%
     # of notional eaten by spread/queue burn on a longshot-heavy book.
     combined_kelly_mult: float = float(os.getenv("COMBINED_KELLY_MULT", "0.075"))

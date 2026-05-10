@@ -393,6 +393,35 @@ async def run() -> None:
     if settings.enable_combined_signal and shared_predictor is not None and _P(combiner_path).exists():
         combined_trader: CombinedTrader | None = None
         if settings.enable_combined_trader:
+            # Build the certified-category allowlist from strategy_certificates
+            # when the gate is enabled. Empty/None disables the gate (legacy
+            # behaviour). One-line rollback: UPDATE strategy_certificates
+            # SET enabled=0 WHERE name='...'.
+            certified_cats: set[str] | None = None
+            if settings.enable_certificate_gate:
+                import sqlite3 as _sql
+                import json as _json
+                _conn = _sql.connect(settings.db_path)
+                try:
+                    _rows = _conn.execute(
+                        "SELECT detail FROM strategy_certificates WHERE enabled=1"
+                    ).fetchall()
+                finally:
+                    _conn.close()
+                certified_cats = set()
+                for (_detail,) in _rows:
+                    try:
+                        _d = _json.loads(_detail or "{}")
+                    except Exception:
+                        continue
+                    _cat = _d.get("category")
+                    if isinstance(_cat, str) and _cat:
+                        certified_cats.add(_cat)
+                log.info(
+                    "certificate_gate_active",
+                    n_certs=len(_rows),
+                    allowed_categories=sorted(certified_cats),
+                )
             combined_trader = CombinedTrader(
                 book_store=book_store,
                 broker=broker,
@@ -412,6 +441,7 @@ async def run() -> None:
                 news_store=news_store,
                 selective_gate=selective_gate,
                 bocpd_gate=bocpd_gate,
+                certified_categories=certified_cats,
             )
         # Shared LLM forecaster + consistency-check state. The runtime task
         # populates `consistency.state[event_id]` and CombinedSignaler reads

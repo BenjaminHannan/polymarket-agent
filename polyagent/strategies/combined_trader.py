@@ -116,6 +116,13 @@ class CombinedTrader:
     # in win-rate). Multiplied into the Kelly stack alongside
     # dd_scale × bandit_scale × throttle.
     bocpd_gate: object | None = None
+    # Strategy-certificate allowlist (CPCV/DSR-validated slices only). When
+    # this is a non-empty set, on_signal rejects any market whose category is
+    # not in the set. When None, the gate is disabled (legacy behaviour: trade
+    # everything that passes the other gates). Built at startup from
+    # `strategy_certificates` rows with enabled=1; rollback is a one-line
+    # SQL UPDATE on that row.
+    certified_categories: set[str] | None = None
 
     def threshold(self, category: str) -> float:
         return self.theta_min_by_category.get(category, self.theta_min_default)
@@ -190,6 +197,18 @@ class CombinedTrader:
                 kill=self.daily_loss_kill,
             )
             return
+
+        # CERTIFICATE GATE. When the strategy_certificates allowlist is
+        # non-empty, only trade categories that have passed CPCV/DSR
+        # validation. Disabled when the set is None.
+        if self.certified_categories is not None:
+            if category not in self.certified_categories:
+                log.info(
+                    "combined_trade_skip_uncertified_category",
+                    category=category,
+                    allowed=sorted(self.certified_categories),
+                )
+                return
 
         # Volume gate
         if (market.volume_24h or 0) < self.min_volume_24h_usd:
