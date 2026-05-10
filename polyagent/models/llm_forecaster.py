@@ -292,7 +292,8 @@ class LLMForecaster:
                 input_ids = tokenizer(prompt, return_tensors="pt").input_ids
             input_ids = input_ids.to(model.device)
 
-            with torch.no_grad():
+            from polyagent.risk.gpu_lock import gpu_section
+            with gpu_section("llm_forecast"), torch.no_grad():
                 out_ids = model.generate(
                     input_ids,
                     max_new_tokens=self.max_new_tokens,

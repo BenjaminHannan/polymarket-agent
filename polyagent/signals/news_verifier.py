@@ -227,7 +227,8 @@ def verify(headline: str, question: str, body: str | None = None) -> Optional[NL
     )
     device = next(model.parameters()).device
     enc = {k: v.to(device) for k, v in enc.items()}
-    with torch.no_grad():
+    from polyagent.risk.gpu_lock import gpu_section
+    with gpu_section("nli_verify"), torch.no_grad():
         out = model(**enc)
     probs = torch.softmax(out.logits, dim=-1).cpu().numpy()[0]
     label_idx = _label_indices(model)
