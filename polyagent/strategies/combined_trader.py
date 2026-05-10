@@ -129,6 +129,11 @@ class CombinedTrader:
     # on_signal multiplies the Kelly fraction by `(1 − wash_share)` for
     # the market — high-wash markets get smaller bets.
     wash_graph_conn: object | None = None
+    # Optional ternary UP/FLAT/DOWN selective gate (Coletta ACM ICAIF
+    # 2021). When set, the directional classification must match the
+    # proposed taker side — abstains on FLAT classification. Strictly
+    # conservative composition with the other gates.
+    ternary_gate: object | None = None
     # BOCPD changepoint gate (§9). Provides a global size multiplier
     # (1.0 normally, 0.5 for K trades after a detected regime change
     # in win-rate). Multiplied into the Kelly stack alongside
@@ -277,6 +282,22 @@ class CombinedTrader:
                     category=category,
                     p_combined=round(p_combined, 4),
                     p_market=round(p_market, 4),
+                )
+                return
+
+        # TERNARY UP/FLAT/DOWN GATE (Coletta ACM ICAIF 2021). The
+        # third selective layer: must classify the candidate as UP
+        # (matches BUY) or DOWN (matches SELL) above the per-side
+        # threshold calibrated from holdout for ≥60% hit rate. FLAT ⇒
+        # abstain regardless of other gates.
+        if self.ternary_gate is not None:
+            proposed_side = "BUY" if (p_combined - p_market) > 0 else "SELL"
+            if not self.ternary_gate.admits(p_combined, p_market, proposed_side):
+                log.info(
+                    "combined_trade_skip_ternary",
+                    category=category,
+                    classification=self.ternary_gate.classify(p_combined, p_market),
+                    proposed_side=proposed_side,
                 )
                 return
 

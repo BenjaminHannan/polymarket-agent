@@ -179,6 +179,12 @@ class PassivePosterV2:
     # set, the per-token wash_share suppresses our quote size linearly:
     # size_effective = quote_size × (1 − wash_share).
     wash_graph_conn: object | None = None
+    # Optional Polymarket maker-rewards tracker (pmwhybetter.md Problem-10
+    # #3; $12M/yr distributed via quadratic-spread formula). When set,
+    # each quote update samples its own (spread_bps, size, time) into
+    # the tracker so the dashboard can show what we'd be earning if we
+    # were a live MM seat.
+    maker_rewards: object | None = None
     # Strategy name for logs / fills.strategy
     strategy_name: str = "passive_poster_v2"
     # Per-token quote state
@@ -557,6 +563,22 @@ class PassivePosterV2:
         if new_q is None:
             return
         quote = self._post_or_replace(token_id, new_q)
+
+        # Sample into the maker-rewards tracker so we can dashboard how
+        # much of the $12M/yr maker-rewards pool our quotes would have
+        # earned (Polymarket quadratic-spread formula).
+        if self.maker_rewards is not None and cur_mid is not None:
+            try:
+                # Half-spread in bps from mid.
+                quote_mid = (quote.bid_price + quote.ask_price) / 2.0
+                half_spread_bps = abs(quote.ask_price - quote.bid_price) / 2.0 * 10_000.0
+                self.maker_rewards.sample(
+                    token_id=token_id,
+                    our_quote_spread_bps=half_spread_bps,
+                    our_quote_size=quote.quote_size,
+                )
+            except Exception:
+                pass
 
         # Try virtual fills on each side, but skip the side suppressed
         # by the inventory-unwind logic (its quote is at the boundary

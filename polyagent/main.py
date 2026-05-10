@@ -506,6 +506,13 @@ async def run() -> None:
                     m.category = resolved_cat
                 if allowed is None or resolved_cat in allowed:
                     target_tokens.append(m.yes_token_id)
+            # Construct VPIN gate + maker-rewards tracker shared with
+            # BookStore so the WSS trade tape feeds it.
+            from polyagent.risk.vpin_gate import VPINGate
+            from polyagent.risk.maker_rewards import MakerRewardsTracker
+            _vpin_gate = VPINGate()
+            book_store.vpin_gate = _vpin_gate
+            _maker_rewards = MakerRewardsTracker()
             v2 = PassivePosterV2(
                 book_store=book_store,
                 broker=broker,
@@ -517,6 +524,8 @@ async def run() -> None:
                 max_realized_vol=settings.passive_v2_max_realized_vol,
                 poll_sec=settings.passive_v2_poll_sec,
                 certified_categories=allowed,
+                vpin_gate=_vpin_gate,
+                maker_rewards=_maker_rewards,
             )
             log.info(
                 "passive_poster_v2_loaded",
@@ -603,6 +612,23 @@ async def run() -> None:
                     lambda: _wallet_analytics_loop(),
                 ))
                 log.info("wallet_analytics_loaded", interval_sec=3600)
+
+            # Foreign-language news poller (pmwhybetter.md Problem-3 #5).
+            # Polls Le Monde, Folha SP, NHK World, Der Spiegel, Xinhua and
+            # routes through the existing LLMForecaster for translation
+            # before inserting into news_store. Disabled when
+            # ENABLE_FOREIGN_NEWS=0.
+            if os.getenv("ENABLE_FOREIGN_NEWS", "1") == "1":
+                from polyagent.data.foreign_news import run_foreign_news_poller
+                tasks.append(_spawn(
+                    "foreign_news",
+                    lambda: run_foreign_news_poller(
+                        news_store=news_store,
+                        llm_forecaster=None,  # translation disabled by default
+                        poll_sec=float(os.getenv("FOREIGN_NEWS_POLL_SEC", "1800")),
+                    ),
+                ))
+                log.info("foreign_news_loaded", poll_sec=1800)
 
             # On-chain OrderFilled ingester (Dubach 2026, arXiv 2604.24366).
             # Polls Polygon RPC for the canonical OrderFilled event and

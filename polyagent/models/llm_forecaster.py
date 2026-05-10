@@ -316,17 +316,43 @@ class LLMForecaster:
             )
             return ""
 
-    def forecast(self, question: str, articles: list[str]) -> dict | None:
+    def forecast(self, question: str, articles: list[str],
+                 *,
+                 market_p: float | None = None,
+                 base_rate: float | None = None,
+                 ) -> dict | None:
         """Returns {"p": float, "n_samples": int, "raw": [floats]} or None.
 
         Per Halawi: N independent samples across multiple temperatures.
         Aggregated via geometric mean of odds for stability.
+
+        When `market_p` is supplied, uses the Market-Conditioned Prompting
+        recipe (arXiv 2602.21229) which explicitly treats the market
+        price as a Bayesian prior and asks the LLM to compute a posterior.
+        This is materially better than the legacy log-pool combine for
+        liquid markets where the LLM has access to news the market
+        already reflects.
         """
         if not self.is_enabled():
             return None
         if not question:
             return None
-        prompt = _build_prompt(question, articles)
+        if market_p is not None:
+            # Market-conditioned prompting path.
+            from polyagent.models.market_conditioned_prompt import (
+                build_market_conditioned_prompt,
+                parse_market_conditioned_response,
+                combine_with_explicit_update,
+            )
+            news_context = "\n\n".join(articles[:5]) if articles else ""
+            prompt = build_market_conditioned_prompt(
+                question=question,
+                market_p=market_p,
+                news_context=news_context,
+                base_rate=base_rate,
+            )
+        else:
+            prompt = _build_prompt(question, articles)
         ps: list[float] = []
         t0 = time.time()
         # Distribute n_samples across the configured temperatures
