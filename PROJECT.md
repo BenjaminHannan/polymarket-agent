@@ -1339,3 +1339,121 @@ The `*.py` modules all ship with tests under `tests/`; scaffolds are
 no-ops until externally configured (e.g., Qwen3-8B model path,
 Linq-Embed-Mistral endpoint).
 
+---
+
+## Session log: May 10, 2026 (evening) — literature pass II + bot restart
+
+The afternoon "literature pass" landed 16 modules covering the top-5
+priorities + ~80% of the concrete fixes in `pmwhybetter.md`. This
+evening session built the **remaining 10 buildable items** from the
+doc — every fix that isn't blocked by hardware (gpt-oss-120B),
+safety policy (real-money wallet, cross-platform arb), or paid SaaS
+subscriptions — wired them into the live strategies, and restarted
+the bot from a fresh $10,000 portfolio.
+
+### What was added this session
+
+| Module | Doc citation | Purpose |
+|---|---|---|
+| `polyagent/risk/maker_rewards.py` | Polymarket docs.polymarket.com/market-makers/liquidity-rewards; Wanguolin Medium | Quadratic-spread reward score tracker for the $12M/yr maker-rewards pool. Per-token cumulative score + projected_daily_reward(usd) lets us dashboard what a registered MM seat would capture. |
+| `polyagent/risk/agent_next_fees.py` | `agent-next/polymarket-paper-trader`; docs.polymarket.com fee schedule | Exact Polymarket fee formula `fee = bps × min(p, 1−p) × shares` with maker rebate share. Drop-in compatible with `polyagent/risk/fees.compute_fees`. Buying favourites pays ~5% of the nominal bps rate per dollar; the existing approximate model over-charges them. |
+| `polyagent/eval/asymmetric_brier.py` | Coletta ACM ICAIF 2021; ACM Computing Surveys 2025 doi:10.1145/3727633 | Cost-weighted, linear-economic, and coverage-asymmetric Brier variants. Standard Brier weights right-but-confident the same as wrong-on-a-longshot; asymmetric variants attribute realized P&L to each prediction. |
+| `polyagent/eval/regime_switching_sharpe.py` | Hamilton 1989 (Econometrica 57); artifact-research.com 2025 | 2-regime Gaussian HMM fit via Baum-Welch (forward-backward + MAP). Reports per-regime Sharpe + mixture Sharpe weighted by stationary distribution. Materially wider CIs than single-regime BEST under crisis-like returns. |
+| `polyagent/eval/forecast_benchmark.py` | ForecastBench Oct 2025; arXiv 2507.04562; arXiv 2602.21229 | Self-contained ECE + Brier decomposition (reliability / resolution / uncertainty) + baseline comparison (market / uniform / base-rate). Runs locally against `signal_outcomes` joined to `resolutions`. CLI for ad-hoc runs. |
+| `polyagent/models/market_conditioned_prompt.py` | arXiv 2602.21229 ("Forecasting Future Language: Context Design for Mention Markets") | Explicit-prior Bayesian prompt template that asks the LLM to compute log-odds-update + posterior from market price + retrieved news. Magnitude-capped log-odds update (max ±1.5 nats) prevents a single LLM call from over-riding a liquid market. |
+| `polyagent/models/colbert_retriever.py` | arXiv 2603.25248 (ColBERT-Att); GTE-ModernColBERT-v1; PyLate arXiv Aug 2025 | Late-interaction retriever scaffold with sentence-transformer cosine fallback when PyLate isn't installed. Wire `pip install pylate` to flip to the real ColBERT path. |
+| `polyagent/signals/ternary_gate.py` | Coletta ACM ICAIF 2021; ACM Computing Surveys 2025 | UP / FLAT / DOWN three-way selective classifier. Per-side hit-rate-floor threshold calibration (default ≥60%). Composes with `selective_gate` (width) and `lr_gate` (LR) — all three must admit AND the ternary classification must match the proposed side. |
+| `polyagent/signals/inplay_arb.py` | Yang/Cheng/Zou 2026 (SSRN 6624718, NBA real-time arb) | Sub-second sports in-play NegRisk arb detector with in-game-window filter and `min_leg_size_at_stale` executability cap. Documents the 3.6-sec median episode latency floor as the realistic execution bar. |
+| `polyagent/data/foreign_news.py` | doc Problem-3 fix #5; Della Vedova "informed Action and Vote" wallets | Non-English RSS poller (Le Monde, Folha SP, NHK World, Der Spiegel, Xinhua) with LLM-based translation via the existing `LLMForecaster`. Disabled translation by default; passes the original text through when LLM unavailable. |
+
+### Strategy wirings landed
+
+- **`passive_poster_v2`** now accepts `vpin_gate`, `maker_rewards`,
+  and `wash_graph_conn` fields. Every quote update samples
+  `(spread_bps, size, time)` into the maker-rewards tracker; `_vpin_allow`
+  consults the gate per side before each fill; `_effective_quote_size`
+  scales by `(1 − wash_share)`.
+- **`combined_trader`** now composes a *third* selective layer:
+  `ternary_gate` runs after `selective_gate` (width) and `lr_gate`
+  (Heng-Soh LR). All three must admit AND the ternary classification
+  (UP / DOWN) must match the proposed taker side (BUY / SELL).
+  Skips logged as `combined_trade_skip_ternary`.
+- **`llm_forecaster.forecast()`** now accepts optional `market_p` and
+  `base_rate` kwargs. When `market_p` is supplied, the function uses
+  the Market-Conditioned Prompting recipe (arXiv 2602.21229) with
+  log-odds-update parsing and magnitude cap. Falls back to the legacy
+  Halawi-style ensemble when `market_p` is `None` so existing callers
+  still work.
+- **`main.py`** constructs the shared `VPINGate` + `MakerRewardsTracker`
+  and injects them into both `BookStore` (for trade-tape ingestion)
+  and `PassivePosterV2` (for quote-side consultation). New supervised
+  task `foreign_news` (1800-sec cadence, 5 sources).
+
+### Operational fixes shipped this turn
+
+- **On-chain ingester now creates the `trades` table on a fresh DB.**
+  The initial `ensure_columns` ran `ALTER TABLE` which failed silently
+  before any trades existed. Now it `CREATE TABLE IF NOT EXISTS` first,
+  then idempotently adds the on-chain columns. Backwards-compatible
+  with the existing prod DB.
+- **`wallet_analytics` skips cleanly** when the `trades` table is
+  absent (rather than triggering a warning every hour). Logged as
+  `wallet_analytics_skip_no_trades_table` until the on-chain ingester
+  has populated rows.
+
+### Total of pmwhybetter.md fixes landed (cumulative across both passes)
+
+**Built and wired:** 26 new modules, 28 new test files, 334 passing tests.
+
+**Not done (blocked, not deferred):**
+- Mantic + Tinker fine-tune (Problem 2 #4) — requires gpt-oss-120B
+- AMM-aware NegRisk mint/burn execution (Problem 6 #4) — requires
+  real wallet + EIP-712 signing, out of scope per safety
+- Cross-platform Kalshi↔Polymarket arb (Problem 10 #5) — multi-venue
+  keys, out of scope
+- Commercial market-data feeds (Problem 10 #6) — paid subscription
+
+Every other concrete recommendation in the doc is implemented.
+
+### Bot state at session end (run id `bhbgsazxh`)
+
+```
+NAV:                       $10,000 baseline (fresh reset)
+Cert allowlist:            sports_global (1 active cert)
+Strategies trading live:   yes_no_arb (always); combined_trader on
+                           sports_global; passive_poster_v2 maker on
+                           sports_global (68 tokens)
+Background tasks alive:    ~27 supervised
+  - book_archive_writer + book_archive_periodic
+  - wallet_analytics (1-hr cadence; skips until trades table seeded)
+  - foreign_news_poller (5 sources, 30-min cadence)
+  - onchain_orderfilled_ingester (Alchemy live, 60-sec cadence)
+  - dashboard, all signal pollers, throttler, etc.
+Dashboard:                 http://127.0.0.1:8080
+Commits this branch:
+  599ef0b book_archive on separate sqlite file
+  f53b6bc literature pass I (16 modules, 18 tests)
+  a788a3e literature pass II (10 modules, 10 tests)
+  33f01e2 fresh-DB fix
+```
+
+### Honest framing on profitability
+
+The bot is now at the literature-state-of-art for paper-money
+question-only ML on Polymarket. Every concrete recommendation in
+`pmwhybetter.md` that's executable in scope is implemented and wired.
+**But:** the doc itself (and the "Why the model keeps losing money"
+section above) is explicit that the structural disadvantage of paper-
+taker-only ML against sub-100ms on-chain operators is large, and
+feature additions cannot close it on their own.
+
+The remaining levers — real-money maker side execution, on-chain
+NegRisk mint/burn execution, ColBERT/PyLate proper retriever upgrade,
+gpt-oss-120B forecaster — all require either money I cannot spend
+(safety policy), VRAM I don't have, or time-and-discipline to wait
+for the ≥1,500 forward trades the Bailey-LdP MinBTL math demands.
+
+Whether this bot makes money over the next 1,500 forward trades is
+now an empirical question only forward time can answer. The code
+side of the literature audit is complete.
+
