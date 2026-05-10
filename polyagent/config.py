@@ -112,6 +112,17 @@ class Settings:
     enable_weather_llm_forecast: bool = os.getenv("ENABLE_WEATHER_LLM_FORECAST", "0") == "1"
     weather_llm_poll_sec: float = float(os.getenv("WEATHER_LLM_POLL_SEC", "1800"))
     weather_llm_min_edge: float = float(os.getenv("WEATHER_LLM_MIN_EDGE", "0.10"))
+
+    # Passive maker (two-sided Avellaneda-Stoikov quoting). Default OFF;
+    # opt in via ENABLE_PASSIVE_POSTER_V2=1. Honors the same
+    # strategy_certificates allowlist as combined_trader. Targets the
+    # certified slice (currently sports_global) on low-volatility books.
+    enable_passive_poster_v2: bool = os.getenv("ENABLE_PASSIVE_POSTER_V2", "0") == "1"
+    passive_v2_poll_sec: float = float(os.getenv("PASSIVE_V2_POLL_SEC", "30"))
+    passive_v2_quote_size: float = float(os.getenv("PASSIVE_V2_QUOTE_SIZE", "25"))
+    passive_v2_gamma: float = float(os.getenv("PASSIVE_V2_GAMMA", "0.05"))
+    passive_v2_max_inv_yes: float = float(os.getenv("PASSIVE_V2_MAX_INV_YES", "200"))
+    passive_v2_max_realized_vol: float = float(os.getenv("PASSIVE_V2_MAX_REALIZED_VOL", "0.02"))
     # Halved Kelly + halved per-trade cap after diagnostic showed 22%
     # of notional eaten by spread/queue burn on a longshot-heavy book.
     combined_kelly_mult: float = float(os.getenv("COMBINED_KELLY_MULT", "0.075"))

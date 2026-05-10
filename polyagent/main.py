@@ -484,6 +484,46 @@ async def run() -> None:
                 bocpd_gate=bocpd_gate,
                 certified_categories=certified_cats,
             )
+
+        # Two-sided maker (Avellaneda-Stoikov quoting on the certified
+        # slice). Default off; opt in via ENABLE_PASSIVE_POSTER_V2=1.
+        # Targets only YES tokens whose market category is in the same
+        # cert allowlist used by combined_trader. Paper-mode: virtual
+        # fills via simulate_passive_fill, routed through broker.submit
+        # so they show up on the dashboard.
+        if settings.enable_passive_poster_v2:
+            from polyagent.strategies.passive_poster_v2 import PassivePosterV2
+            from polyagent.models.categorize import categorize as _categorize
+            allowed = certified_cats if (certified_cats and len(certified_cats) > 0) else None
+            # Gamma's category field is empty on most live markets; fall
+            # back to the local categorizer so the v2 allowlist filter
+            # actually finds sports/weather/etc. markets in the main scan.
+            target_tokens = []
+            for m in markets:
+                resolved_cat = m.category or _categorize(m.question or "")
+                if not m.category:
+                    m.category = resolved_cat
+                if allowed is None or resolved_cat in allowed:
+                    target_tokens.append(m.yes_token_id)
+            v2 = PassivePosterV2(
+                book_store=book_store,
+                broker=broker,
+                markets_by_token=markets_by_token,
+                target_tokens=target_tokens,
+                gamma=settings.passive_v2_gamma,
+                quote_size=settings.passive_v2_quote_size,
+                max_total_inventory_yes=settings.passive_v2_max_inv_yes,
+                max_realized_vol=settings.passive_v2_max_realized_vol,
+                poll_sec=settings.passive_v2_poll_sec,
+                certified_categories=allowed,
+            )
+            log.info(
+                "passive_poster_v2_loaded",
+                n_targets=len(target_tokens),
+                certified_categories=sorted(allowed) if allowed else None,
+            )
+            tasks.append(_spawn("passive_poster_v2", lambda: v2.run()))
+
         # Shared LLM forecaster + consistency-check state. The runtime task
         # populates `consistency.state[event_id]` and CombinedSignaler reads
         # the same dict to downweight the llm_forecaster expert when an
