@@ -25,6 +25,15 @@ sparse books (most price levels empty); ~70 sports_global tokens at
 fill-triggered snapshots (sparse) ~10 KB/day. Total: <1 MB/day for
 the certified slice.
 
+**Storage isolation: book_archive runs on its OWN sqlite file**
+(default `<dirname(DB_PATH)>/book_archive.db`) so its writes don't
+contend on the main paper.db WAL with the broker's high-frequency
+fills. The main DB had been seeing book_archive batch commits time
+out at 30s busy_timeout because aiosqlite was always mid-transaction.
+Override path via BOOK_ARCHIVE_DB_PATH env var. Replay queries
+(replay_book_at, archive_stats, scripts/inspect_book_archive)
+need to be passed the archive db path explicitly.
+
 Default OFF behind ENABLE_BOOK_ARCHIVE=1.
 """
 from __future__ import annotations
@@ -39,6 +48,20 @@ from dataclasses import dataclass
 import structlog
 
 log = structlog.get_logger()
+
+
+def archive_db_path(main_db_path: str) -> str:
+    """Resolve the book_archive db file location.
+
+    Env override: BOOK_ARCHIVE_DB_PATH. Default: a sibling file named
+    `book_archive.db` next to the main paper.db, so the archive's WAL
+    is fully isolated from the bot's hot writer.
+    """
+    explicit = os.getenv("BOOK_ARCHIVE_DB_PATH")
+    if explicit:
+        return explicit
+    import os.path as _op
+    return _op.join(_op.dirname(main_db_path) or ".", "book_archive.db")
 
 
 # ── Schema ──────────────────────────────────────────────────────────────

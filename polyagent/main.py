@@ -532,9 +532,14 @@ async def run() -> None:
             # the per-fill WAL contention with the broker's aiosqlite handle.
             if settings.enable_book_archive:
                 from polyagent.risk.book_archive import (
-                    BookArchiveWriter, periodic_snapshot_loop, set_writer,
+                    BookArchiveWriter, archive_db_path,
+                    periodic_snapshot_loop, set_writer,
                 )
-                _ba_writer = BookArchiveWriter(settings.db_path)
+                # Run the archive on its OWN sqlite file so its WAL
+                # writer doesn't contend with the broker's high-frequency
+                # paper.db writes.
+                _ba_db = archive_db_path(settings.db_path)
+                _ba_writer = BookArchiveWriter(_ba_db)
                 set_writer(_ba_writer)
                 tasks.append(_spawn(
                     "book_archive_writer",
@@ -545,12 +550,13 @@ async def run() -> None:
                     lambda: periodic_snapshot_loop(
                         book_store=book_store,
                         target_tokens=target_tokens,
-                        db_path=settings.db_path,
+                        db_path=_ba_db,
                         interval_sec=settings.book_archive_periodic_sec,
                     ),
                 ))
                 log.info(
                     "book_archive_loaded",
+                    db_path=_ba_db,
                     n_tokens=len(target_tokens),
                     interval_sec=settings.book_archive_periodic_sec,
                 )

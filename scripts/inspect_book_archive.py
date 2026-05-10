@@ -13,7 +13,9 @@ import json
 import sqlite3
 
 from polyagent.config import settings
-from polyagent.risk.book_archive import archive_stats, decode_book, replay_book_at
+from polyagent.risk.book_archive import (
+    archive_db_path, archive_stats, decode_book, replay_book_at,
+)
 
 
 def main() -> None:
@@ -22,9 +24,12 @@ def main() -> None:
     p.add_argument("--replay", type=float, default=None,
                    help="UTC unix timestamp to replay book at; requires --token")
     p.add_argument("--last", type=int, default=10)
+    p.add_argument("--db", default=None,
+                   help="path to book_archive db (default: from BOOK_ARCHIVE_DB_PATH or sibling of paper.db)")
     args = p.parse_args()
 
-    conn = sqlite3.connect(settings.db_path)
+    db_path = args.db or archive_db_path(settings.db_path)
+    conn = sqlite3.connect(db_path)
 
     if args.token and args.replay:
         book = replay_book_at(conn, args.token, args.replay)

@@ -175,17 +175,17 @@ class PaperBroker:
         await self.db.commit()
         await self._migrate_nav_history()
         await self._migrate_fills_shadow_queue()
-        # Eagerly create the round_trip_legs and book_snapshots tables
-        # so dashboard / inspection queries can target them before the
-        # first fill / periodic snapshot lands.
+        # Eagerly create the round_trip_legs table so dashboard /
+        # inspection queries can target it before the first fill.
+        # NOTE: book_snapshots lives on a separate db file when
+        # ENABLE_BOOK_ARCHIVE=1; its table is created by the
+        # BookArchiveWriter when the writer task starts.
         try:
             import sqlite3 as _sql
             from polyagent.risk.round_trips import ensure_table as _rt_ensure
-            from polyagent.risk.book_archive import ensure_table as _ba_ensure
             _c = _sql.connect(settings.db_path)
             try:
                 _rt_ensure(_c)
-                _ba_ensure(_c)
             finally:
                 _c.close()
         except Exception as e:
