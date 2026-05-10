@@ -93,6 +93,16 @@ class Settings:
     # existing deployments keep current behaviour; opt in to restrict trading
     # to the slices that have actually passed CPCV/DSR validation.
     enable_certificate_gate: bool = os.getenv("ENABLE_CERTIFICATE_GATE", "0") == "1"
+
+    # Natural-event ingest (USGS earthquakes + NASA EONET storms/wildfires/
+    # volcanoes/floods). Default OFF; opt in via ENABLE_NATURAL_EVENTS=1.
+    # Polls USGS every poll_sec (~3 min) and EONET every eonet_poll_sec
+    # (~30 min). Persists to a `natural_events` SQLite table; the
+    # natural_event_match.py matcher consumes new events and emits
+    # market-direction signals against active weather-category markets.
+    enable_natural_events: bool = os.getenv("ENABLE_NATURAL_EVENTS", "0") == "1"
+    natural_events_poll_sec: float = float(os.getenv("NATURAL_EVENTS_POLL_SEC", "180"))
+    natural_events_eonet_poll_sec: float = float(os.getenv("NATURAL_EVENTS_EONET_POLL_SEC", "1800"))
     # Halved Kelly + halved per-trade cap after diagnostic showed 22%
     # of notional eaten by spread/queue burn on a longshot-heavy book.
     combined_kelly_mult: float = float(os.getenv("COMBINED_KELLY_MULT", "0.075"))

@@ -150,3 +150,72 @@ async def fetch_active_markets(limit: int = 100, min_liquidity: float = 0.0) -> 
 
     log.info("gamma_markets_fetched", count=len(markets), min_liquidity=min_liquidity)
     return markets
+
+
+async def fetch_markets_by_category(
+    category: str, *, limit: int = 200, min_liquidity: float = 100.0,
+    pages: int = 5,
+) -> list[Market]:
+    """Pull active markets and filter to a specific category client-side.
+
+    Weather/event markets tend to have lower 24h volume than politics or
+    crypto, so they get filtered out of the top-500-by-volume scan. The
+    Gamma API's `tag` filter doesn't reliably restrict by our parsed
+    category, so we paginate through `pages × 500` highest-volume active
+    markets and select those whose computed category matches.
+    """
+    url = f"{settings.gamma_url}/markets"
+    markets: list[Market] = []
+    timeout = aiohttp.ClientTimeout(total=30)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        for page in range(pages):
+            params = {
+                "active": "true",
+                "closed": "false",
+                "archived": "false",
+                "limit": "500",
+                "offset": str(page * 500),
+                "order": "volume24hr",
+                "ascending": "false",
+            }
+            try:
+                async with session.get(url, params=params) as r:
+                    r.raise_for_status()
+                    data = await r.json()
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                log.warning("gamma_category_page_error", page=page, err=str(e))
+                break
+            rows = data.get("data") if isinstance(data, dict) else (data if isinstance(data, list) else [])
+            if not rows:
+                break
+            for m in rows:
+                parsed = _to_market(m)
+                if parsed is None or not parsed.accepting_orders:
+                    continue
+                if parsed.liquidity < min_liquidity:
+                    continue
+                if not parsed.condition_id or not parsed.yes_token_id:
+                    continue
+                # Gamma's category field is often empty on live markets;
+                # fall back to our local categorizer (same one signal_outcomes
+                # uses) so the filter is consistent with historical labels.
+                resolved_cat = parsed.category
+                if not resolved_cat:
+                    try:
+                        from polyagent.models.categorize import categorize as _cat
+                        resolved_cat = _cat(parsed.question)
+                    except Exception:
+                        resolved_cat = None
+                if (resolved_cat or "").lower() != category.lower():
+                    continue
+                # Stamp the resolved category back onto the market so
+                # downstream consumers see a consistent value.
+                parsed.category = resolved_cat
+                markets.append(parsed)
+                if len(markets) >= limit:
+                    break
+            if len(markets) >= limit:
+                break
+
+    log.info("gamma_markets_by_category", category=category, count=len(markets), pages_fetched=page + 1)
+    return markets
