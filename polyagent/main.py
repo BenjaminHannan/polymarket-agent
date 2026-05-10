@@ -524,6 +524,27 @@ async def run() -> None:
             )
             tasks.append(_spawn("passive_poster_v2", lambda: v2.run()))
 
+            # Book-snapshot archive (Path 1: self-record L2 going forward).
+            # Fill-time snapshots happen automatically inside PaperBroker
+            # when ENABLE_BOOK_ARCHIVE=1. The periodic loop here adds
+            # baseline coverage between fills.
+            if settings.enable_book_archive:
+                from polyagent.risk.book_archive import periodic_snapshot_loop
+                tasks.append(_spawn(
+                    "book_archive_periodic",
+                    lambda: periodic_snapshot_loop(
+                        book_store=book_store,
+                        target_tokens=target_tokens,
+                        db_path=settings.db_path,
+                        interval_sec=settings.book_archive_periodic_sec,
+                    ),
+                ))
+                log.info(
+                    "book_archive_loaded",
+                    n_tokens=len(target_tokens),
+                    interval_sec=settings.book_archive_periodic_sec,
+                )
+
         # Shared LLM forecaster + consistency-check state. The runtime task
         # populates `consistency.state[event_id]` and CombinedSignaler reads
         # the same dict to downweight the llm_forecaster expert when an

@@ -117,6 +117,14 @@ class Settings:
     # opt in via ENABLE_PASSIVE_POSTER_V2=1. Honors the same
     # strategy_certificates allowlist as combined_trader. Targets the
     # certified slice (currently sports_global) on low-volatility books.
+    # Self-record L2 book snapshots going forward (pmwhy.md Path 1 for
+    # the queue-aware backtest data gap). Snapshots fire on every fill
+    # plus periodically on certified-category tokens. Storage is
+    # zlib-compressed JSON in book_snapshots — typically <1 MB/day for
+    # the certified slice. Default OFF.
+    enable_book_archive: bool = os.getenv("ENABLE_BOOK_ARCHIVE", "0") == "1"
+    book_archive_periodic_sec: float = float(os.getenv("BOOK_ARCHIVE_PERIODIC_SEC", "300"))
+
     enable_passive_poster_v2: bool = os.getenv("ENABLE_PASSIVE_POSTER_V2", "0") == "1"
     passive_v2_poll_sec: float = float(os.getenv("PASSIVE_V2_POLL_SEC", "30"))
     passive_v2_quote_size: float = float(os.getenv("PASSIVE_V2_QUOTE_SIZE", "25"))

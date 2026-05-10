@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -174,18 +175,21 @@ class PaperBroker:
         await self.db.commit()
         await self._migrate_nav_history()
         await self._migrate_fills_shadow_queue()
-        # Eagerly create the round_trip_legs table so dashboard queries
-        # can target it before the first fill lands.
+        # Eagerly create the round_trip_legs and book_snapshots tables
+        # so dashboard / inspection queries can target them before the
+        # first fill / periodic snapshot lands.
         try:
             import sqlite3 as _sql
             from polyagent.risk.round_trips import ensure_table as _rt_ensure
+            from polyagent.risk.book_archive import ensure_table as _ba_ensure
             _c = _sql.connect(settings.db_path)
             try:
                 _rt_ensure(_c)
+                _ba_ensure(_c)
             finally:
                 _c.close()
         except Exception as e:
-            log.warning("round_trip_table_init_failed", err=str(e))
+            log.warning("auxiliary_table_init_failed", err=str(e))
         await self._recover_state()
 
     async def _migrate_fills_shadow_queue(self) -> None:
@@ -698,6 +702,22 @@ class PaperBroker:
                     self.cash -= fees.taker_fee_paid
                 if fees.maker_rebate_credited > 0:
                     self.cash += fees.maker_rebate_credited
+                # Book-snapshot archive (path 1 — self-record L2 going
+                # forward). Every fill captures the book at fill-time so
+                # downstream cert validation can replay queue position
+                # under realistic fills. Default off behind ENABLE_BOOK_ARCHIVE.
+                try:
+                    if os.getenv("ENABLE_BOOK_ARCHIVE", "0") == "1":
+                        from polyagent.risk.book_archive import snapshot as _book_snapshot
+                        import sqlite3 as _sql
+                        _ba_conn = _sql.connect(settings.db_path, timeout=10.0)
+                        try:
+                            _book_snapshot(_ba_conn, token_id, book, trigger="fill", ts=ts)
+                        finally:
+                            _ba_conn.close()
+                except Exception as e:
+                    log.warning("book_archive_fill_snap_failed", err=str(e))
+
                 # Round-trip P&L attribution: pair this fill against
                 # earlier opposite-side fills via FIFO matching. Lets us
                 # measure realized round-trip P&L per strategy without
