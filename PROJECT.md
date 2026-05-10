@@ -1459,6 +1459,118 @@ side of the literature audit is complete.
 
 ---
 
+## Model-improvement roadmap (May 10 review)
+
+After the literature pass II commit (`a788a3e`) declared "26 modules
+built, every concrete pmwhybetter.md fix in scope landed," an
+external reviewer pushed back on the claim by reading what was
+*actually wired* versus what was *built but unwired or scaffolded*.
+The review identified six candidate model improvements (distinct
+from execution / risk / discipline improvements, which the existing
+PROJECT.md "Where to look next" already covers) and ranked them by
+realised-P&L leverage. This section captures the analysis and the
+chosen action.
+
+### Meta-framing
+
+The reviewer's central observation: the May 10 quant-review already
+prescribes a feature freeze and ≥1,500 forward trades before any
+further model surgery. Of the six candidate improvements, **only one
+has an answer that doesn't require those 1,500 trades** — it can be
+evaluated against the existing 7,442-row `signal_outcomes` table
+immediately. The rest fight the structural ceiling that question-
+only ML on Polymarket is +0.14 log-loss *worse* than the market on
+the head-to-head sample, and the Akey 2026 finding ("1σ increase in
+maker volume share lowers loss probability by 9.3pp") dominates
+anything further model surgery can buy.
+
+So the meta-answer to "what should we do next?" is: the falsifiable
+one first. If it passes, ship. If it fails (it did), the rest of the
+list is correctly deferred under the feature freeze.
+
+### The six candidates, ranked
+
+| # | Improvement | Doc citation | Status |
+|---|---|---|---|
+| 1 | Migrate `sports_global` volume features to trade-count / net-flow / unique-wallets / top-wallet-share | Sirolly Nov 2025 (SSRN 5714122) | **Tested. Falsified.** See below. |
+| 2 | Wire `hierarchical_calibrator.py` as partial-pooling replacement for the isotonic ≥80 / V-A ≥30 / Beta ≥15 / global fallback chain in `calibrator.py` | Mulligan QMF 2024; Manokhin arXiv 2605.03816; PROJECT.md top-5 priority #3 | Module built, **not wired**. Deferred. |
+| 3 | Replace `selective_gate.py` (width-based) with `likelihood_ratio_gate.py` (Heng-Soh RLog), rather than running both as conjunctive layers | Heng & Soh ICLR 2025 (arXiv 2505.15008) | Module built, **layered not replaced**. Architectural cleanup deferred. |
+| 4 | Flip `colbert_retriever.py` from cosine-fallback scaffold to real PyLate / GTE-ModernColBERT late-interaction path | arXiv 2603.25248; PyLate Aug 2025 | Module built, **scaffold not implementation**. Requires `pip install pylate` + corpus re-indexing. Deferred. |
+| 5 | Add TabPFN v2.5 as a 5th combiner expert | Hollmann Nature 2025 | Not built. Out of pmwhybetter.md scope. Deferred. |
+| 6 | Outcome-RL / Turtel DPO fine-tune on Qwen3-8B-NVFP4 | arXiv 2502.05253; arXiv 2505.17989 | `scripts/finetune_qwen3_outcome_rl.py` runnable. Defensibly deferred per top-5 #5: "wait for queue-aware reconciliation." |
+
+### Reasoning for choosing #1
+
+Five independent reasons aligned:
+
+1. **Same-day answer.** The hypothesis was evaluable by retraining
+   LightGBM on the existing `signal_outcomes` ⋈ `historical_trades`
+   join and comparing Brier on a chronological hold-out. No forward
+   trading required. Every other item on the list needs ≥500 future
+   resolved trades to actually pay off in realised P&L.
+
+2. **Targets the certified slice.** Items #2–#6 either operate at
+   pipeline scope (#2 calibration tier) or improve experts (#4, #6
+   retriever / forecaster) that already have shrunk weight in the
+   log-pool combiner. Item #1 directly modifies the LightGBM that
+   feeds the `sports_global` cert — the one slice currently trading.
+
+3. **Smallest surface.** One feature swap + one retrain run +
+   one chronological evaluation. The other items require multiple
+   call-site changes, dependency installs, or hyperparameter searches.
+
+4. **The contamination is documented.** Sirolly Nov 2025 puts sports
+   as the worst-affected wash category (20% steady-state / 60% Dec
+   2024 peak). PROJECT.md already records this caveat. The hypothesis
+   has external support — *if* the population-average wash share
+   applies to our dataset, the swap is correct.
+
+5. **Avoids the scaffolding trap.** The literature pass II commit
+   shipped three modules (#2, #3, #4 above) that *appear*
+   complete but aren't wired into the hot path. Doing more of the
+   same risks declaring success without the empirical work to
+   support it. Item #1 carries no such risk because the verdict is
+   empirical, not declarative.
+
+### Disposition after the experiment
+
+The wash-volume hypothesis failed empirically — `volume` is the
+top-1 feature by LightGBM gain importance on `sports_global`, and
+removing it collapses AUC by −0.18. Details in the next session log.
+
+The disposition of items #2–#6 is unchanged by the falsification:
+
+- **#2 (hierarchical calibrator wiring)** — module exists; wiring is
+  a real production change that would touch the live calibration
+  pipeline. Needs forward data to measure the realised lift. Defer
+  until ≥500 forward trades have accumulated on multiple categories.
+- **#3 (LR gate replacing not layering)** — current state is over-
+  conservative but working. Removing a live gate is risky and the
+  win is marginal. Defer.
+- **#4 (ColBERT flip)** — `pip install pylate` + index build is a
+  half-day task; the realised payoff comes from the LLM forecaster
+  expert which has shrunk weight in the combiner. Bounded upside.
+- **#5 (TabPFN v2.5)** — combiner refactor cost is real; Brier
+  improvement is the kind of thing the queue-aware reconciliation
+  needs to land first to know whether the improvement compounds
+  against realistic fills or paper inflation.
+- **#6 (Outcome-RL/DPO)** — script is runnable end-to-end with the
+  installed deps; the training run is ~4–6 hours of GPU time but
+  the realised payoff is also constrained by combiner shrinkage.
+
+### Rule extracted from this exercise
+
+**Before stripping a feature based on a published contamination
+claim, measure the model's signal-to-noise gradient against that
+contamination on our own data.** Sirolly's 20% wash share is real
+*as a population average*; whether it applies to our specific
+training cohort is an empirical question that takes minutes to
+answer. `scripts/eval_decontaminated_features.py` is the artefact
+that answers it for the sports_global slice, and is the template
+for future contamination claims.
+
+---
+
 ## Session log: May 10, 2026 (late evening) — wash-volume hypothesis falsified
 
 The morning's session-end framing flagged the Sirolly Nov 2025
