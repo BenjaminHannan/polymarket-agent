@@ -487,6 +487,61 @@ class Dashboard:
     async def api_by_category(self, request: web.Request) -> web.Response:
         return web.json_response(self._by_category())
 
+    async def api_failures(self, request: web.Request) -> web.Response:
+        return web.json_response(self._failures())
+
+    def _failures(self) -> dict:
+        """Aggregate model_failures: counts by type, by category, recent rows."""
+        try:
+            conn = _read_only_conn(self.db_path)
+            by_type = [
+                dict(r) for r in conn.execute(
+                    """SELECT failure_type, COUNT(*) AS n,
+                              ROUND(AVG(severity), 4) AS avg_severity,
+                              ROUND(AVG(log_loss_model), 4) AS avg_log_loss
+                       FROM model_failures
+                       GROUP BY failure_type ORDER BY 2 DESC"""
+                )
+            ]
+            by_cat = [
+                dict(r) for r in conn.execute(
+                    """SELECT COALESCE(category, '(none)') AS category,
+                              COUNT(*) AS n,
+                              ROUND(AVG(severity), 4) AS avg_severity
+                       FROM model_failures
+                       GROUP BY category ORDER BY 2 DESC LIMIT 12"""
+                )
+            ]
+            recent = [
+                dict(r) for r in conn.execute(
+                    """SELECT condition_id, resolved_ts, yes_won,
+                              p_model, p_market, failure_type, severity,
+                              category, question, notional_traded, realized_pnl
+                       FROM model_failures
+                       ORDER BY resolved_ts DESC LIMIT 25"""
+                )
+            ]
+            worst = [
+                dict(r) for r in conn.execute(
+                    """SELECT severity, p_model, p_market, yes_won,
+                              failure_type, category, question
+                       FROM model_failures
+                       WHERE failure_type IN
+                             ('high_confidence_wrong','model_loud_wrong_market_right')
+                       ORDER BY severity DESC LIMIT 10"""
+                )
+            ]
+            total = conn.execute("SELECT COUNT(*) FROM model_failures").fetchone()[0]
+            conn.close()
+        except Exception as e:
+            log.warning("dashboard_failures_query_error", err=str(e))
+            return {"total": 0, "by_type": [], "by_category": [], "recent": [], "worst": []}
+        # ISO-format timestamps for display
+        for r in recent:
+            r["ts_iso"] = time.strftime("%Y-%m-%d", time.gmtime(r.get("resolved_ts") or 0))
+        return {"total": int(total), "by_type": by_type, "by_category": by_cat,
+                "recent": recent, "worst": worst}
+
     async def api_pessimistic_nav(self, request: web.Request) -> web.Response:
         """Compute realized P&L using shadow ledger pessimistic prices.
 
@@ -571,6 +626,7 @@ class Dashboard:
         app.router.add_get("/api/pessimistic", self.api_pessimistic_nav)
         app.router.add_get("/api/certificates", self.api_certificates)
         app.router.add_get("/api/by-category", self.api_by_category)
+        app.router.add_get("/api/failures", self.api_failures)
         runner = web.AppRunner(app)
         await runner.setup()
         site = web.TCPSite(runner, "127.0.0.1", self.port)
@@ -710,13 +766,15 @@ DASHBOARD_HTML = """<!doctype html>
     border-bottom: 1px solid var(--border);
   }
   th {
-    background: rgba(13,17,23,0.6);
+    background: #0a0e14;
     color: var(--muted);
     font-weight: 500;
     font-size: 11px;
     text-transform: uppercase;
     letter-spacing: 0.04em;
-    position: sticky; top: 53px; /* below sticky header */
+    /* No sticky positioning: each table is short enough that pinning
+       headers to the viewport caused them to slide into adjacent rows
+       (specifically appearing between data rows in by-category). */
   }
   td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
   tbody tr:last-child td { border-bottom: none; }
@@ -751,18 +809,26 @@ DASHBOARD_HTML = """<!doctype html>
     border-left: 3px solid var(--border-2);
   }
   .cert-card.enabled { border-left-color: var(--pos); }
-  .cert-card.disabled { border-left-color: var(--neg); opacity: 0.7; }
+  .cert-card.disabled { border-left-color: var(--neg); }
+  .cert-card.disabled .name { color: #8b949e; }
   .cert-card .name {
     font-weight: 600; font-size: 13px;
     display: flex; justify-content: space-between; align-items: center;
     gap: 8px;
+    word-break: break-word;
   }
   .cert-card .row {
     margin-top: 6px; display: flex; justify-content: space-between;
-    font-size: 12px; color: var(--muted);
+    font-size: 12px; color: #9ca3a9;
   }
-  .cert-card .row .v { color: var(--text); font-variant-numeric: tabular-nums; }
-  .cert-card .reason { font-size: 11px; color: var(--muted); margin-top: 8px; line-height: 1.4; }
+  .cert-card .row .v {
+    color: var(--text); font-variant-numeric: tabular-nums;
+    font-weight: 500;
+  }
+  .cert-card .reason {
+    font-size: 11px; color: #9ca3a9; margin-top: 10px; line-height: 1.45;
+    padding-top: 10px; border-top: 1px solid var(--border);
+  }
   #nav-chart-wrap {
     background: var(--panel);
     border: 1px solid var(--border);
@@ -770,6 +836,11 @@ DASHBOARD_HTML = """<!doctype html>
     padding: 16px;
   }
   #nav-chart { width: 100%; height: 280px; display: block; }
+  .failure-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(380px, 1fr));
+    gap: 14px;
+  }
   #nav-tip {
     position: absolute;
     pointer-events: none;
@@ -848,6 +919,31 @@ DASHBOARD_HTML = """<!doctype html>
         </tr>
       </thead>
       <tbody id="by-category"><tr><td colspan="10" class="small">loading…</td></tr></tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>model failures <span class="count" id="failures-count">0</span></h2>
+    <div class="failure-grid">
+      <div>
+        <h3 class="small" style="color:var(--muted);text-transform:uppercase;letter-spacing:0.05em;margin:0 0 8px 0">by type</h3>
+        <table>
+          <thead><tr><th>failure type</th><th class="num">n</th><th class="num">avg severity</th><th class="num">avg log-loss</th></tr></thead>
+          <tbody id="failures-by-type"><tr><td colspan="4" class="small">loading…</td></tr></tbody>
+        </table>
+      </div>
+      <div>
+        <h3 class="small" style="color:var(--muted);text-transform:uppercase;letter-spacing:0.05em;margin:0 0 8px 0">by category</h3>
+        <table>
+          <thead><tr><th>category</th><th class="num">n</th><th class="num">avg severity</th></tr></thead>
+          <tbody id="failures-by-category"><tr><td colspan="3" class="small">loading…</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+    <h3 class="small" style="color:var(--muted);text-transform:uppercase;letter-spacing:0.05em;margin:18px 0 8px 0">worst high-confidence misses</h3>
+    <table>
+      <thead><tr><th>severity</th><th>type</th><th>cat</th><th class="num">p_model</th><th class="num">p_mkt</th><th>actual</th><th>question</th></tr></thead>
+      <tbody id="failures-worst"><tr><td colspan="7" class="small">loading…</td></tr></tbody>
     </table>
   </section>
 
@@ -1068,6 +1164,68 @@ function renderCertificates(data) {
   }
 }
 
+function renderFailures(data) {
+  document.getElementById('failures-count').textContent =
+    (data.total || 0) + ' total · ' +
+    (data.by_type || []).filter(r => r.failure_type === 'high_confidence_wrong')
+      .reduce((s, r) => s + (r.n || 0), 0) + ' high-confidence';
+
+  const tBody = document.getElementById('failures-by-type');
+  tBody.innerHTML = '';
+  if (!data.by_type || !data.by_type.length) {
+    tBody.innerHTML = '<tr><td colspan="4" class="small">no failures recorded yet</td></tr>';
+  } else {
+    for (const r of data.by_type) {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `
+        <td>${r.failure_type}</td>
+        <td class="num">${r.n}</td>
+        <td class="num">${r.avg_severity?.toFixed?.(3) ?? '—'}</td>
+        <td class="num">${r.avg_log_loss?.toFixed?.(3) ?? '—'}</td>
+      `;
+      tBody.appendChild(tr);
+    }
+  }
+
+  const cBody = document.getElementById('failures-by-category');
+  cBody.innerHTML = '';
+  if (!data.by_category || !data.by_category.length) {
+    cBody.innerHTML = '<tr><td colspan="3" class="small">—</td></tr>';
+  } else {
+    for (const r of data.by_category) {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `
+        <td><span class="pill pill-cat">${r.category}</span></td>
+        <td class="num">${r.n}</td>
+        <td class="num">${r.avg_severity?.toFixed?.(3) ?? '—'}</td>
+      `;
+      cBody.appendChild(tr);
+    }
+  }
+
+  const wBody = document.getElementById('failures-worst');
+  wBody.innerHTML = '';
+  if (!data.worst || !data.worst.length) {
+    wBody.innerHTML = '<tr><td colspan="7" class="small">—</td></tr>';
+  } else {
+    for (const r of data.worst) {
+      const tr = document.createElement('tr');
+      const actualPill = r.yes_won ? '<span class="pill pill-yes">YES</span>' : '<span class="pill pill-no">NO</span>';
+      const ftShort = r.failure_type.replace('_', ' ').replace(/_/g, ' ');
+      tr.innerHTML = `
+        <td class="num">${(r.severity ?? 0).toFixed(3)}</td>
+        <td class="small">${ftShort}</td>
+        <td>${r.category ? `<span class="pill pill-cat">${r.category}</span>` : '<span class="small">—</span>'}</td>
+        <td class="num">${(r.p_model ?? 0).toFixed(3)}</td>
+        <td class="num">${r.p_market !== null && r.p_market !== undefined ? r.p_market.toFixed(3) : '—'}</td>
+        <td>${actualPill}</td>
+        <td>${(r.question || '').slice(0,90)}</td>
+      `;
+      wBody.appendChild(tr);
+    }
+  }
+}
+
 function renderByCategory(rows) {
   const tbody = document.getElementById('by-category');
   tbody.innerHTML = '';
@@ -1249,16 +1407,18 @@ async function loadAll() {
     const certs = await fetchJSON('/api/certificates');
     renderCertificates(certs);
 
-    const [s, p, f, n, r, bc] = await Promise.all([
+    const [s, p, f, n, r, bc, fl] = await Promise.all([
       fetchJSON('/api/summary'),
       fetchJSON('/api/positions'),
       fetchJSON('/api/fills?limit=40'),
       fetchJSON('/api/nav-history?limit=500'),
       fetchJSON('/api/resolutions?limit=20'),
       fetchJSON('/api/by-category'),
+      fetchJSON('/api/failures'),
     ]);
     renderSummary(s);
     renderByCategory(bc);
+    renderFailures(fl);
     renderPositions(p);
     renderFills(f);
     renderNavChart(n);

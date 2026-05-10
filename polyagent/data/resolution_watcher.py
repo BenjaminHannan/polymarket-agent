@@ -185,6 +185,46 @@ async def _check_one(
         )
     except Exception as e:
         log.warning("materialize_outcome_error", condition_id=market.condition_id, err=str(e))
+
+    # Failure tracking: classify the just-materialised row and write to
+    # model_failures so the dashboard + retraining can audit where the
+    # model missed. Wrapped in try/except — failure-tracking errors must
+    # never break the settlement path.
+    try:
+        import sqlite3 as _sql
+        from polyagent.models.failure_tracker import record_failures
+        conn = _sql.connect(settings.db_path)
+        try:
+            row = conn.execute(
+                """SELECT p_stat_lgbm,
+                          COALESCE(p_market_24h, p_market_6h, p_market_1h, p_market_pre) AS p_market,
+                          category
+                   FROM signal_outcomes WHERE condition_id = ?""",
+                (market.condition_id,),
+            ).fetchone()
+            if row is not None:
+                p_stat, p_mkt, cat = row
+                notional_traded = float(
+                    (res.get("yes_size", 0) or 0) * (res.get("yes_avg_cost", 0) or 0)
+                    + (res.get("no_size", 0) or 0) * (res.get("no_avg_cost", 0) or 0)
+                ) if isinstance(res, dict) else 0.0
+                realized_pnl = float(res.get("pnl", 0.0) or 0.0) if isinstance(res, dict) else 0.0
+                record_failures(
+                    conn,
+                    condition_id=market.condition_id,
+                    resolved_ts=time.time(),
+                    yes_won=int(yes_won),
+                    p_model=float(p_stat) if p_stat is not None else None,
+                    p_market=float(p_mkt) if p_mkt is not None else None,
+                    category=cat,
+                    question=market.question,
+                    notional_traded=notional_traded,
+                    realized_pnl=realized_pnl,
+                )
+        finally:
+            conn.close()
+    except Exception as e:
+        log.warning("failure_record_error", condition_id=market.condition_id, err=str(e))
     return res is not None
 
 
