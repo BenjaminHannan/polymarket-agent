@@ -902,6 +902,119 @@ Commits: `e411cfc` (cert gate + sports_global cert), `bc98db1`
 
 ---
 
+## Session log: May 10, 2026 — quant review + execution-stack pivot
+
+A senior-quant review (`pmwhy.md`, in repo root) reframes the project's
+priorities. The review's core argument, with citation:
+
+> The bot's flat ROI is exactly what the literature predicts. The 2026
+> microstructure literature on Polymarket and Kalshi (Bartlett & O'Hara
+> SSRN 6615739, Akey et al. SSRN 6443103, IMDEA AFT 2025, Tsang & Yang
+> SSRN 6336679) independently converges: retail taker-side trading is
+> structurally unprofitable. Bots had 52% raw accuracy vs retail's 55%
+> — bots win on execution, not prediction. Maker side earned ~2× spread
+> per contract from the systematic YES-overbet behavioural surplus.
+> ForecastBench shows even frontier RAG-LLM forecasters (Brier 0.1258)
+> trail market consensus (0.1106) on liquid markets. The path to
+> profitability for a single-operator question-only ML system is not
+> better features; it's better execution.
+
+### What was empirically validated against our data
+
+The review's A6 caveat — "selective abstention helps Sharpe only if
+edge is concentrated in the high-confidence tail, which at this n you
+cannot test from forward fills" — was tested directly against the
+7,447 head-to-head rows in `signal_outcomes`. Findings (run
+`scripts/analyze_high_confidence_tail.py` to refresh):
+
+**Whole sample, model log-loss vs market by confidence:**
+
+| confidence = `\|p_model − 0.5\| × 2` | n | model_LL | market_LL | delta |
+|---|---|---|---|---|
+| [0.00, 0.10) | 544  | 0.7028 | 0.3263 | +0.38 |
+| [0.30, 0.50) | 1059 | 0.6052 | 0.2486 | +0.36 |
+| [0.70, 0.90) | 1532 | 0.3596 | 0.2759 | +0.08 |
+| [0.90, 1.00) | 3332 | 0.2537 | 0.2339 | +0.02 |
+
+Model approaches market parity in its high-confidence tail.
+
+**Sports_global slice (the certified one), same buckets:**
+
+| confidence | n | model_LL | market_LL | delta |
+|---|---|---|---|---|
+| [0.30, 0.50) | 30  | 0.85 | 0.60 | **+0.24** model worse |
+| [0.70, 0.90) | 147 | 0.24 | 0.32 | **−0.08** model better |
+| [0.90, 1.00) | 429 | 0.11 | 0.22 | **−0.12** model better |
+
+The certified +0.128 log-loss edge is **entirely concentrated in
+confidence ≥ 0.7**. At medium confidence the model is worse than
+market.
+
+**Naive-PnL Sharpe by confidence (whole sample, betting model-favored
+side at market price):**
+
+| confidence | n | mean_pnl | Sharpe |
+|---|---|---|---|
+| [0.00, 0.10) | 544  | −$0.13 | −0.42 |
+| [0.30, 0.50) | 1059 | +$0.02 | +0.08 |
+| [0.70, 0.90) | 1532 | +$0.07 | +0.26 |
+| [0.90, 1.00) | 3332 | +$0.11 | **+0.47** |
+
+Sharpe rises monotonically with confidence. **Selective abstention is
+a Sharpe lever, not just a Brier lever**, contradicting the review's
+hedged "this is not directly evidenced" position.
+
+**Implication.** A confidence-threshold gate on
+`combined_trader.on_signal` (drop trades below `|p_combined − 0.5| × 2
+< 0.7`) would compress fill count but materially improve realized P&L
+per trade. This is the cheapest Sharpe-positive change available.
+
+### Doc updates landed this session
+
+- `CLAUDE.md` (repo root) rewritten: "honest performance ceiling"
+  reflects the structural critique, "where to look next" reorders
+  priorities to (1) queue-aware fill simulation, (2) maker-side
+  execution, (3) confidence-threshold gate, (4) forward-test cert
+  with corrected sample size. Adds explicit warnings that paper P&L
+  overstates live by 20–40% and that detecting Sharpe 0.3–0.5 needs
+  ~1,500–3,000 OOS forward trades, not the project's earlier ≥500.
+- `pmwhy.md` checked into repo root as the citable source.
+- `scripts/analyze_high_confidence_tail.py` runs the bucket
+  analysis in ~1 second against `signal_outcomes` + `model_failures`.
+
+### What stays the same
+
+- Cert gate, falsifiability discipline, three-tier rollback — still
+  the right architecture. The review explicitly endorses Bailey-López
+  de Prado / DSR / CPCV / "log every config tried."
+- `sports_global` cert stays enabled. The high-confidence-tail
+  finding *strengthens* it: the certified edge is real where the
+  model is loud about it, not at all confidences uniformly.
+- `yes_no_arb` keeps running. The review notes single-condition arb
+  is sub-100ms-bot-dominated, but our paper version is essentially
+  free to run as a discipline-keeping baseline.
+
+### What changes
+
+- New priority list (top to bottom): queue-aware fill sim → maker
+  execution (`passive_poster_v2`) → confidence-threshold gate →
+  forward-test under realistic fills with ≥1,500 trade target.
+- LLM forecaster, NLI verifier, news_match — all log-only, treat as
+  inventory-skew inputs for a future maker rather than as standalone
+  alpha.
+- Strict feature-freeze. No new model changes until the queue-aware
+  simulator lands and the cert is re-validated under it.
+
+### Empirical state at session end
+
+Bot still running: NAV $9,915 (mid), 36 open positions, 190 fills,
++$149 realized P&L since broker init, cert gate active on
+sports_global, dashboard at http://127.0.0.1:8080 with the new
+model_failures section showing 1,921 historical failures across
+4 types.
+
+---
+
 ## Where to look next
 
 If you wanted to spend another week:

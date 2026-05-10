@@ -16,6 +16,8 @@ Concretely:
 - A strategy that has been measured and **failed** validation gets a row with `enabled=0` and a `reason` field documenting why. This is an audit trail, not just a kill switch.
 - The cert criterion is rigorous: 8-fold purged CPCV with market-id grouping, sign-test on per-fold edge, DSR ≥ 0.95 (Bailey/Lopez de Prado 2014). PBO is computed but treated carefully — with a single config it collapses to 0.5 and is uninformative.
 - "I think this should work" is not a reason to ship. "8/8 folds positive, p=0.004, DSR=0.996" is.
+- **Paper P&L is optimistic.** The current `PaperBroker` uses VWAP fills with no queue model. Per the HFT/MM literature (hftbacktest docs, Quantopian-era data) this overstates live P&L by 20–40% in low-liquidity venues. Any cert that uses paper-fill P&L is provisional until validated on a queue-aware simulator. Do not treat paper Sharpe as live Sharpe.
+- **Sample-size targets are higher than they look.** Bailey & López de Prado's MinBTL math: detecting a Sharpe 0.3–0.5 edge (realistic for question-only ML on Polymarket) needs ~1,500–3,000 fully-resolved OOS forward trades, not the ≥500 the project's earlier docs assumed. For correlated baskets multiply by 2–3×.
 
 If you (Claude) are tempted to enable a strategy by default to "let it accumulate data," **don't**. Log-only is the correct mode for any signal whose edge is unmeasured. The bot already runs `yes_no_arb` (risk-free, by definition certifiable) and the certified `sports_global` combiner; everything else is log-only or behind opt-in env flags.
 
@@ -262,12 +264,32 @@ See `PROJECT.md` for the full session log. Most recent:
 
 ## Honest performance ceiling
 
-A question-only ML model on Polymarket has a structural ceiling near zero ROI even with all gates. Realistic targets:
+A question-only, taker-only, paper-broker ML system on Polymarket has a structural ceiling near zero ROI even with all gates. The 2026 microstructure literature (Bartlett & O'Hara, Akey et al., IMDEA, Bloomberg/Della Vedova) converges: retail taker-side trading is **structurally unprofitable** on prediction markets — bots had 52% raw accuracy vs retail's 55%, **bots win on execution, not prediction**. Maker side earned ~2× spread per contract from the systematic-YES-overbet behavioural surplus. The IMDEA arbitrage profits ($29M NegRisk + $10.58M single-condition over 12 months) are captured by sub-100ms operators on atomic on-chain `convertPositions` calls — a paper VWAP broker cannot compete.
+
+Realistic targets given that ceiling:
 - Brier ~0.09–0.11 with the full literature stack
 - ROI roughly flat, ±2% per session is normal noise
-- **Positive ROI lives** in (a) certified narrow slices like `sports_global` (the +0.128 log-loss edge translates to small but real PnL), (b) maker-side spread capture (Yang 2026: $121/market making vs $63 taking — paper-mode only), (c) NegRisk arbitrage if the partial-group artifact problem can be solved (IMDEA: $29M of $40M of all Polymarket arb 2024-2025).
+- **Positive ROI lives** in (a) certified narrow slices like `sports_global` *with selective abstention on the high-confidence tail* (see "High-confidence-tail finding" below — this is the only literature-backed taker edge for question-only ML), (b) **maker-side spread capture** (Bartlett-O'Hara 2026, Polymarket Maker Rebates 20–25%, Akey et al. SSRN 6443103: "for 1-in-5 losers, the lower-bound cost of taking liquidity alone is enough to flip PnL from negative to positive"), (c) on-chain NegRisk arbitrage with co-located low-latency execution (out of scope per safety policy).
 
-Directional model bets on question text alone are not the path. Specialization, structured retrieval, and execution-side capture are.
+Directional model bets on question text alone are not the path. ForecastBench shows even frontier RAG-LLMs (Brier 0.1258) trail market consensus (0.1106) on liquid markets — meaning a state-of-the-art LLM forecaster has near-zero post-fee taker edge. Our `weather_llm_forecast` and `news_nli_match` are research projects, not profit levers.
+
+---
+
+## High-confidence-tail finding (2026-05-10 analysis)
+
+The senior-quant review observed that **selective abstention via Venn-Abers / conformal prediction improves Sharpe only if the model's edge is concentrated in its high-confidence tail**. We tested this empirically on the 7,447 head-to-head rows (`signal_outcomes` joined to `p_market_24h`):
+
+| confidence | sports_global model_LL | sports_global market_LL | delta |
+|---|---|---|---|
+| [0.30, 0.50) | 0.85 | 0.60 | **+0.24** model worse |
+| [0.70, 0.90) | 0.24 | 0.32 | **−0.08** model better |
+| [0.90, 1.00) | 0.11 | 0.22 | **−0.12** model better |
+
+The certified +0.128 log-loss edge **is entirely in confidence ≥ 0.7**. At medium confidence the model is worse than market.
+
+Whole-sample naive PnL Sharpe rises monotonically with confidence: −0.42 at confidence < 0.10, +0.47 at confidence ≥ 0.90. This means a **confidence-threshold gate** on `combined_trader.on_signal` (drop trades with `|p_combined - 0.5| < 0.7`, say) would compress fill count but materially improve realized P&L per trade. This is a Sharpe-positive change with empirical support.
+
+Run `scripts/analyze_high_confidence_tail.py` to refresh the bucket table.
 
 ---
 
@@ -275,14 +297,19 @@ Directional model bets on question text alone are not the path. Specialization, 
 
 If the user says "what now":
 
-1. **Forward-test the `sports_global` cert.** Watch fills land over 24-48h. If cumulative edge tracks `+0.128 × n × notional` within 1σ → cert is real. If flat or negative across 20+ fills → disable via the SQL one-liner.
-2. **Audit `news_keyword_match` the same way `stat_lgbm` was audited.** Backfill `p_news_match` on resolved markets with news signals; check calibration; identify category sub-slices where it beats market.
-3. **External sport data for sports_global.** Team Elo + schedule + recent form + home/away from FBref / transfermarkt would actually expand the +0.128 edge. Regex features alone are a wash (proven this session).
-4. **Better news verifier.** Try `MoritzLaurer/DeBERTa-v3-base-mnli-fever-anli` or wire a Claude/GPT API call for top-100 markets only.
+The senior-quant review (`pmwhy.md`) reorders our priorities. The new ranking, with literature support, is:
+
+1. **Build queue-aware fill simulation.** Our `PaperBroker` uses VWAP fills with no queue model — the single largest source of paper-to-live Sharpe degradation in the HFT/MM literature. hftbacktest is the canonical reference; NautilusTrader's Polymarket adapter is the pragmatic alternative. Re-run all certified strategies through the new fill model and expect Sharpe to compress 30–60%. The certs that still pass under realistic fills are the real edges.
+2. **Build maker-side execution (`passive_poster_v2`).** The 2026 fee/rebate regime explicitly subsidises this: makers pay zero, receive 20–25% of taker fees as USDC rebates. Bartlett & O'Hara 2026 documents the ~2× spread per contract maker advantage from the YES-overbet behavioural surplus. Akey et al. (SSRN 6443103) shows for 1-in-5 retail losers, switching from taker to maker would flip their PnL positive. This is where 70% of engineering effort should go.
+3. **Add a confidence-threshold gate to `combined_trader`** before the cert gate. The high-confidence-tail finding above says this is Sharpe-positive on existing data. Cheap one-line change in `combined_trader.on_signal`.
+4. **Forward-test `sports_global` cert under the new fill model** — but with the corrected sample-size target: **≥1,500–3,000 OOS forward trades**, not 500. Bailey-López de Prado's MinBTL math says detecting a Sharpe 0.3–0.5 edge (realistic for question-only ML) needs ~3–6× more trades than the original "≥500" estimate.
 
 Things to **not** do:
-- Stop adding features. Run for weeks, accumulate ≥500 resolved trades, then re-evaluate.
-- Anything that requires real-money keys (LP making, on-chain arb, etc.) — out of scope per safety policy.
+- Stop adding features. Strict feature-freeze until ≥1,500 forward trades accumulate. Every new config inflates the multiple-testing burden in DSR (Bailey-López de Prado 2014).
+- Stop hoping the LLM forecaster will rescue this. Frontier RAG-LLMs trail market consensus on liquid markets; gpt-oss-20b and Phi-4-mini are an order of magnitude below frontier.
+- Anything that requires real-money keys (LP making, on-chain NegRisk arb) — out of scope per safety policy.
+
+The big-picture answer: **the bot is not making money because it's competing in the most-bot-saturated taker niches with paper-quality infrastructure**, and the gap to profitability is structural (execution stack), not algorithmic. Source: `pmwhy.md` (in repo root) — read in full before any architecture decision.
 
 ---
 
