@@ -593,13 +593,23 @@ async def run() -> None:
                             conn = _sqlite3.connect(settings.db_path, timeout=30.0)
                             try:
                                 conn.execute("PRAGMA busy_timeout=30000")
-                                # Della Vedova orthogonality test:
-                                compute_wallet_stats(
-                                    conn, p_threshold=0.01, min_trades=50,
-                                )
-                                # Sirolly wash-graph scores:
-                                compute_wallet_signatures(conn)
-                                compute_market_wash_scores(conn)
+                                # Skip cleanly if the trades table hasn't
+                                # been populated yet (on-chain ingester
+                                # creates it on first successful poll).
+                                has_trades = bool(conn.execute(
+                                    "SELECT name FROM sqlite_master "
+                                    "WHERE type='table' AND name='trades'"
+                                ).fetchone())
+                                if not has_trades:
+                                    log.info("wallet_analytics_skip_no_trades_table")
+                                else:
+                                    # Della Vedova orthogonality test:
+                                    compute_wallet_stats(
+                                        conn, p_threshold=0.01, min_trades=50,
+                                    )
+                                    # Sirolly wash-graph scores:
+                                    compute_wallet_signatures(conn)
+                                    compute_market_wash_scores(conn)
                             finally:
                                 conn.close()
                         except Exception as e:

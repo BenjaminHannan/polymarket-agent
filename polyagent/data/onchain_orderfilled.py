@@ -155,7 +155,21 @@ def _split_data(data_hex: str, n_words: int) -> list[str]:
 
 
 def ensure_columns(conn: sqlite3.Connection) -> None:
-    """Idempotently add the two on-chain columns to the trades table."""
+    """Idempotently create the trades table + add the two on-chain
+    columns. Safe to call on a fresh DB."""
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS trades (
+            tx_hash TEXT PRIMARY KEY,
+            wallet TEXT,
+            counterparty_wallet TEXT,
+            asset TEXT,
+            side TEXT,
+            size REAL,
+            price REAL,
+            timestamp REAL,
+            direction_source TEXT DEFAULT 'wss'
+        )"""
+    )
     cols = {r[1] for r in conn.execute("PRAGMA table_info(trades)")}
     if "direction_source" not in cols:
         conn.execute(
