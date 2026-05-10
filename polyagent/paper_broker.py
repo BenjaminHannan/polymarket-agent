@@ -744,13 +744,14 @@ class PaperBroker:
                 # under realistic fills. Default off behind ENABLE_BOOK_ARCHIVE.
                 try:
                     if os.getenv("ENABLE_BOOK_ARCHIVE", "0") == "1":
-                        from polyagent.risk.book_archive import snapshot as _book_snapshot
-                        import sqlite3 as _sql
-                        _ba_conn = _sql.connect(settings.db_path, timeout=10.0)
-                        try:
-                            _book_snapshot(_ba_conn, token_id, book, trigger="fill", ts=ts)
-                        finally:
-                            _ba_conn.close()
+                        # Path-3 fix: enqueue to the singleton writer instead
+                        # of opening a per-fill sync connection. Encoding
+                        # happens synchronously inside enqueue_snapshot
+                        # (~1ms) so we capture book state at fill time;
+                        # the writer drains asynchronously and batches
+                        # inserts into a single transaction.
+                        from polyagent.risk.book_archive import enqueue_snapshot as _ba_enq
+                        _ba_enq(token_id, book, trigger="fill", ts=ts)
                 except Exception as e:
                     log.warning("book_archive_fill_snap_failed", err=str(e))
 
@@ -776,7 +777,8 @@ class PaperBroker:
                     # underlying sync API (round_trips uses sync sqlite).
                     # Easier path: open a short-lived sync connection.
                     import sqlite3 as _sql
-                    rt_conn = _sql.connect(settings.db_path, timeout=10.0)
+                    rt_conn = _sql.connect(settings.db_path, timeout=30.0)
+                    rt_conn.execute("PRAGMA busy_timeout=30000")
                     try:
                         record_fill(rt_conn, rt_ctx)
                     finally:

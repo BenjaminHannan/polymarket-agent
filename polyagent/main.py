@@ -525,11 +525,21 @@ async def run() -> None:
             tasks.append(_spawn("passive_poster_v2", lambda: v2.run()))
 
             # Book-snapshot archive (Path 1: self-record L2 going forward).
-            # Fill-time snapshots happen automatically inside PaperBroker
-            # when ENABLE_BOOK_ARCHIVE=1. The periodic loop here adds
-            # baseline coverage between fills.
+            # Path-3 architecture: a single long-lived writer task drains an
+            # asyncio.Queue and batches inserts. Producers (broker fill path
+            # + periodic loop) sync-encode the book and push to the queue
+            # without ever opening their own sqlite connection — eliminates
+            # the per-fill WAL contention with the broker's aiosqlite handle.
             if settings.enable_book_archive:
-                from polyagent.risk.book_archive import periodic_snapshot_loop
+                from polyagent.risk.book_archive import (
+                    BookArchiveWriter, periodic_snapshot_loop, set_writer,
+                )
+                _ba_writer = BookArchiveWriter(settings.db_path)
+                set_writer(_ba_writer)
+                tasks.append(_spawn(
+                    "book_archive_writer",
+                    lambda: _ba_writer.run(),
+                ))
                 tasks.append(_spawn(
                     "book_archive_periodic",
                     lambda: periodic_snapshot_loop(

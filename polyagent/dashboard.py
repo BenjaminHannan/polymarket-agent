@@ -49,9 +49,9 @@ log = structlog.get_logger()
 
 
 def _read_only_conn(db_path: str) -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path, timeout=10.0)
+    conn = sqlite3.connect(db_path, timeout=60.0)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA busy_timeout=10000")
+    conn.execute("PRAGMA busy_timeout=60000")
     return conn
 
 
@@ -463,38 +463,43 @@ class Dashboard:
         return out
 
     # ─────────── handlers ───────────
+    # All sync sqlite reads moved off the event loop via asyncio.to_thread.
+    # Without this, the dashboard's concurrent fetchJSON() Promise.all
+    # piles up on the WAL writer (WSS feed + fills + book_archive +
+    # round_trips all writing) and timeouts at 10s. With to_thread the
+    # event loop stays responsive even while individual queries wait
+    # on WAL.
     async def api_summary(self, request: web.Request) -> web.Response:
-        return web.json_response(self._summary())
+        return web.json_response(await asyncio.to_thread(self._summary))
 
     async def api_positions(self, request: web.Request) -> web.Response:
-        return web.json_response(self._positions())
+        return web.json_response(await asyncio.to_thread(self._positions))
 
     async def api_fills(self, request: web.Request) -> web.Response:
         limit = int(request.query.get("limit", "50"))
-        return web.json_response(self._recent_fills(limit))
+        return web.json_response(await asyncio.to_thread(self._recent_fills, limit))
 
     async def api_nav_history(self, request: web.Request) -> web.Response:
         limit = int(request.query.get("limit", "500"))
-        return web.json_response(self._nav_history(limit))
+        return web.json_response(await asyncio.to_thread(self._nav_history, limit))
 
     async def api_resolutions(self, request: web.Request) -> web.Response:
         limit = int(request.query.get("limit", "25"))
-        return web.json_response(self._recent_resolutions(limit))
+        return web.json_response(await asyncio.to_thread(self._recent_resolutions, limit))
 
     async def api_certificates(self, request: web.Request) -> web.Response:
-        return web.json_response(self._certificates())
+        return web.json_response(await asyncio.to_thread(self._certificates))
 
     async def api_by_category(self, request: web.Request) -> web.Response:
-        return web.json_response(self._by_category())
+        return web.json_response(await asyncio.to_thread(self._by_category))
 
     async def api_failures(self, request: web.Request) -> web.Response:
-        return web.json_response(self._failures())
+        return web.json_response(await asyncio.to_thread(self._failures))
 
-    async def api_round_trips(self, request: web.Request) -> web.Response:
+    def _round_trips(self) -> dict:
         """Round-trip P&L summary by strategy + recent closed round-trips."""
         try:
             conn = _read_only_conn(self.db_path)
-            # Per-strategy summaries
             strategies = [r[0] for r in conn.execute(
                 "SELECT DISTINCT strategy FROM round_trip_legs"
             )]
@@ -513,10 +518,13 @@ class Dashboard:
             conn.close()
         except Exception as e:
             log.warning("dashboard_round_trips_query_error", err=str(e))
-            return web.json_response({"per_strategy": [], "recent": []})
+            return {"per_strategy": [], "recent": []}
         for r in recent:
             r["close_iso"] = time.strftime("%Y-%m-%d %H:%M", time.gmtime(r.get("close_ts") or 0))
-        return web.json_response({"per_strategy": per_strategy, "recent": recent})
+        return {"per_strategy": per_strategy, "recent": recent}
+
+    async def api_round_trips(self, request: web.Request) -> web.Response:
+        return web.json_response(await asyncio.to_thread(self._round_trips))
 
     def _failures(self) -> dict:
         """Aggregate model_failures: counts by type, by category, recent rows."""
@@ -570,14 +578,7 @@ class Dashboard:
         return {"total": int(total), "by_type": by_type, "by_category": by_cat,
                 "recent": recent, "worst": worst}
 
-    async def api_pessimistic_nav(self, request: web.Request) -> web.Response:
-        """Compute realized P&L using shadow ledger pessimistic prices.
-
-        Joins fills + fills_shadow + resolutions to figure out:
-        - what we paid (pessimistic_price × size)
-        - what we received at settle (1.0 × size if winning leg, else 0)
-        Returns the parallel pessimistic P&L for resolved fills only.
-        """
+    def _pessimistic_nav(self) -> list:
         try:
             conn = _read_only_conn(self.db_path)
             rows = conn.execute(
@@ -599,21 +600,23 @@ class Dashboard:
             ).fetchall()
             conn.close()
         except Exception as e:
-            return web.json_response({"err": str(e)}, status=500)
-        return web.json_response(
-            [
-                {
-                    "strategy": r["strategy"],
-                    "n_resolved": r["n"],
-                    "realized_pnl_vwap": round(float(r["realized_pnl"] or 0), 2),
-                    "realized_pnl_pessimistic": round(float(r["pess_pnl"] or 0), 2),
-                    "execution_cost_estimate": round(
-                        float((r["realized_pnl"] or 0) - (r["pess_pnl"] or 0)), 2
-                    ),
-                }
-                for r in rows
-            ]
-        )
+            return [{"err": str(e)}]
+        return [
+            {
+                "strategy": r["strategy"],
+                "n_resolved": r["n"],
+                "realized_pnl_vwap": round(float(r["realized_pnl"] or 0), 2),
+                "realized_pnl_pessimistic": round(float(r["pess_pnl"] or 0), 2),
+                "execution_cost_estimate": round(
+                    float((r["realized_pnl"] or 0) - (r["pess_pnl"] or 0)), 2
+                ),
+            }
+            for r in rows
+        ]
+
+    async def api_pessimistic_nav(self, request: web.Request) -> web.Response:
+        """Compute realized P&L using shadow ledger pessimistic prices."""
+        return web.json_response(await asyncio.to_thread(self._pessimistic_nav))
 
     async def api_health(self, request: web.Request) -> web.Response:
         # Lightweight liveness/readiness probe.
