@@ -206,6 +206,7 @@ class PaperBroker:
             ("maker_rebate_credited", "ALTER TABLE fills_shadow_queue ADD COLUMN maker_rebate_credited REAL DEFAULT 0"),
             ("cancel_latency_penalty", "ALTER TABLE fills_shadow_queue ADD COLUMN cancel_latency_penalty REAL DEFAULT 0"),
             ("effective_fill_price", "ALTER TABLE fills_shadow_queue ADD COLUMN effective_fill_price REAL"),
+            ("rebate_density_adjusted", "ALTER TABLE fills_shadow_queue ADD COLUMN rebate_density_adjusted REAL DEFAULT 0"),
         ]:
             if col not in cols:
                 try:
@@ -646,6 +647,37 @@ class PaperBroker:
                 else:
                     eff_price = price
                     cl_penalty = 0.0
+                # Density-adjusted maker rebate: scale the upper-bound
+                # (22% of taker fee) by our visible market share at the
+                # quote level. Paper-mode honest paper-P&L estimate.
+                rebate_adj = 0.0
+                if is_maker and fees.maker_rebate_credited > 0:
+                    try:
+                        from polyagent.risk.rebate_density import adjust_rebate
+                        # Estimate "visible book size at or better than our
+                        # quote": for a maker BUY (resting bid), the same-
+                        # side bids at or above our price; for a maker SELL,
+                        # the same-side asks at or below our price.
+                        if side == "BUY" and book.bids:
+                            visible = sum(
+                                float(s) for p, s in book.bids.items()
+                                if float(p) >= price - 1e-9
+                            )
+                        elif side == "SELL" and book.asks:
+                            visible = sum(
+                                float(s) for p, s in book.asks.items()
+                                if float(p) <= price + 1e-9
+                            )
+                        else:
+                            visible = size  # we're alone if no comparable side
+                        adj = adjust_rebate(
+                            upper_bound=fees.maker_rebate_credited,
+                            our_quote_size=size,
+                            visible_book_size_at_or_better=visible,
+                        )
+                        rebate_adj = adj.adjusted_rebate
+                    except Exception as e:
+                        log.warning("rebate_density_failed", err=str(e))
                 if cmp.get("available"):
                     await self.db.execute(
                         """INSERT INTO fills_shadow_queue
@@ -653,8 +685,9 @@ class PaperBroker:
                             pessimistic_price, size, levels_walked, partial,
                             slippage_bps_walked, slippage_bps_pess,
                             is_maker, taker_fee_paid, maker_rebate_credited,
-                            cancel_latency_penalty, effective_fill_price)
-                           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                            cancel_latency_penalty, effective_fill_price,
+                            rebate_density_adjusted)
+                           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                         (
                             fill_id,
                             cmp["top_of_book"],
@@ -670,6 +703,7 @@ class PaperBroker:
                             fees.maker_rebate_credited,
                             cl_penalty,
                             eff_price,
+                            rebate_adj,
                         ),
                     )
                 else:
@@ -682,9 +716,10 @@ class PaperBroker:
                             pessimistic_price, size, levels_walked, partial,
                             slippage_bps_walked, slippage_bps_pess,
                             is_maker, taker_fee_paid, maker_rebate_credited,
-                            cancel_latency_penalty, effective_fill_price)
+                            cancel_latency_penalty, effective_fill_price,
+                            rebate_density_adjusted)
                            VALUES (?, NULL, NULL, NULL, ?, NULL, NULL, NULL, NULL,
-                                   ?, ?, ?, ?, ?)""",
+                                   ?, ?, ?, ?, ?, ?)""",
                         (
                             fill_id, size,
                             int(is_maker),
@@ -692,6 +727,7 @@ class PaperBroker:
                             fees.maker_rebate_credited,
                             cl_penalty,
                             eff_price,
+                            rebate_adj,
                         ),
                     )
                 # Apply fee/rebate to cash so live broker state reflects
