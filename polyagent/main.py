@@ -393,16 +393,18 @@ async def run() -> None:
     # the poller persists every new event to the `natural_events` table
     # and invokes the matcher on each one so weather-category markets
     # get a deterministic direction signal in the `signals` table.
-    if settings.enable_natural_events:
-        from polyagent.data.natural_events import run as natural_events_run
+    weather_markets: list = []
+    if settings.enable_natural_events or settings.enable_weather_llm_forecast:
         from polyagent.gamma import fetch_markets_by_category
-        from polyagent.signals.natural_event_match import NaturalEventMatcher
         # Weather markets have lower 24h volume than the politics/crypto
         # markets in the main scan, so we pull them by category tag.
         weather_markets = await fetch_markets_by_category(
             "weather", limit=300, min_liquidity=100.0
         )
-        log.info("natural_event_markets_loaded", n=len(weather_markets))
+        log.info("weather_markets_loaded", n=len(weather_markets))
+    if settings.enable_natural_events:
+        from polyagent.data.natural_events import run as natural_events_run
+        from polyagent.signals.natural_event_match import NaturalEventMatcher
         natural_matcher = NaturalEventMatcher(
             markets=weather_markets,
             news_store=news_store,
@@ -411,6 +413,22 @@ async def run() -> None:
             "natural_events",
             lambda: natural_events_run(callback=natural_matcher.on_event),
         ))
+    # LLM-augmented weather forecaster — runs on a slow loop (default 30
+    # min) and synthesises (a) the natural_events catalog (b) historical
+    # base rates from resolutions (c) the question itself into a single
+    # calibrated probability via LLMForecaster. Emits a
+    # `weather_llm_forecast` signal when |p_llm - p_market| >= min_edge.
+    if settings.enable_weather_llm_forecast and weather_markets:
+        from polyagent.signals.weather_forecaster import WeatherForecaster
+        weather_llm = WeatherForecaster(
+            book_store=book_store,
+            markets=weather_markets,
+            news_store=news_store,
+            db_path=settings.db_path,
+            poll_sec=settings.weather_llm_poll_sec,
+            min_edge=settings.weather_llm_min_edge,
+        )
+        tasks.append(_spawn("weather_llm_forecast", lambda: weather_llm.run()))
 
     combiner_path = settings.combiner_path or str(_P(settings.db_path).parent / "combiner.joblib")
     if settings.enable_combined_signal and shared_predictor is not None and _P(combiner_path).exists():

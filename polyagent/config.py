@@ -103,6 +103,15 @@ class Settings:
     enable_natural_events: bool = os.getenv("ENABLE_NATURAL_EVENTS", "0") == "1"
     natural_events_poll_sec: float = float(os.getenv("NATURAL_EVENTS_POLL_SEC", "180"))
     natural_events_eonet_poll_sec: float = float(os.getenv("NATURAL_EVENTS_EONET_POLL_SEC", "1800"))
+
+    # LLM-augmented weather forecaster: pairs LLMForecaster with structured
+    # retrieval over natural_events + historical resolution base rates.
+    # Default OFF; requires ENABLE_LLM_FORECASTER=1 too. Slow loop (~30 min)
+    # because each LLM call is ~10-30s; meant to run alongside, not block,
+    # the main combined trader.
+    enable_weather_llm_forecast: bool = os.getenv("ENABLE_WEATHER_LLM_FORECAST", "0") == "1"
+    weather_llm_poll_sec: float = float(os.getenv("WEATHER_LLM_POLL_SEC", "1800"))
+    weather_llm_min_edge: float = float(os.getenv("WEATHER_LLM_MIN_EDGE", "0.10"))
     # Halved Kelly + halved per-trade cap after diagnostic showed 22%
     # of notional eaten by spread/queue burn on a longshot-heavy book.
     combined_kelly_mult: float = float(os.getenv("COMBINED_KELLY_MULT", "0.075"))
