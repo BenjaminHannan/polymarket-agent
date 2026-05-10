@@ -738,6 +738,170 @@ gate; nothing ships on intuition.
 
 ---
 
+## Session log: May 9, 2026 — calibration audit + strategy-certificate gate
+
+Took the discipline thread one step further: instead of "let the bot
+trade everything that passes the gates", restrict live trading to
+slices where the model has *actually* been shown to beat the market
+on held-out data. Built and committed the infrastructure to enforce
+that.
+
+### What got measured
+
+`signal_outcomes` had 10,215 labeled rows (resolved markets with
+`p_stat_lgbm` populated) but only **42** had a market price column
+filled — `p_market_*` was overwhelmingly NULL. Without market price
+you can't measure edge. So:
+
+1. Ran `scripts/backfill_market_prices.py` against CLOB
+   `/prices-history`. **7,442 / 10,215 rows (72.9%) populated** with
+   horizon prices (1h/6h/24h/7d), 0 errors. The 2,773 misses were
+   markets with insufficient price history (mostly <24h-old
+   resolutions).
+
+2. **Overall calibration of `stat_lgbm` (n=7,442 head-to-head):**
+   - Model log-loss 0.3959, market log-loss **0.2544** → market beats
+     model by **+0.14 log-loss**.
+   - At the live trigger `|p_model − p_market| ≥ 0.10` (n=4,235),
+     directional accuracy is **47.6%** — sub-random.
+   - The model gets **more wrong** as it disagrees more loudly:
+     disagreement bucket [0.40, 1.00) shows model_LL 0.84 vs market_LL
+     0.42 (+0.42 delta).
+
+3. **Per-category combiner** trained with `[stat_lgbm,
+   p_market_24h]` log-pool weights. Only `sports_global` produces
+   meaningful stat-side weight (0.53 stat / 0.47 market) AND beats
+   market alone:
+
+   | category | n | stat weight | log-loss | beats market? |
+   |---|---|---|---|---|
+   | crypto | 710 | 0.00 | 0.174 | combiner == market |
+   | politics_us | 467 | 0.02 | 0.097 | combiner == market |
+   | sports_us | 615 | 0.17 | 0.029 | marginal |
+   | other | 3757 | 0.35 | 0.263 | combiner ≈ market |
+   | **sports_global** | **626** | **0.53** | **0.163** | **yes (Δ=−0.087)** |
+
+4. **Held-out CPCV on `sports_global` only** (8 folds, market-id
+   purged): **8/8 folds positive**, mean per-fold edge **+0.128
+   log-loss vs market alone**, std 0.040, sign-test p = 0.0039,
+   **DSR = 0.9959**. PBO=0.5 — but PBO is a single-config artifact
+   here (it requires multiple competing configs to discriminate;
+   with one strategy it collapses to ~0.5 by construction). The
+   `validate_strategy.py` harness has the same artifact.
+
+### Roadmap items shipped this session
+
+| # | Item | Falsifiability | Status |
+|---|---|---|---|
+| 1 | calibration audit of `stat_lgbm` across full backfilled cohort | n=7,442 head-to-head; market beats model by +0.14 log-loss; directional accuracy 47.6% (sub-random) at live trigger | **`stat_lgbm` cert: enabled=0** — model correctly stays log-only globally |
+| 2 | per-category combiner v2 with `[stat_lgbm, p_market_24h]` log-pool weights | bundle saved to `data/combiner_v2.joblib` with 6 trained categories | **shipped** — runtime loads via `COMBINER_PATH` env override |
+| 3 | `sports_global` combiner certification | 8/8 CPCV folds positive, DSR=0.996, sign-test p=0.004, mean edge +0.128 log-loss | **cert: enabled=1** — first non-arb strategy to clear honest validation |
+| 4 | `strategy_certificates`-driven category allowlist on `CombinedTrader` | 4 unit tests in `test_certificate_gate.py` + live verification: bot logs `combined_trade_skip_uncertified_category` for non-sports_global markets and `certificate_gate_active n_certs=1 allowed_categories=["sports_global"]` on startup | **shipped, live** behind `ENABLE_CERTIFICATE_GATE=1` |
+| 5 | `DB_PATH` / `LOG_PATH` env overrides | enables running the bot from any cwd / git worktree against the canonical DB | **shipped** |
+| 6 | dashboard upgrade: certificate panel + by-category rollup + improved NAV chart | new endpoints `/api/certificates`, `/api/by-category`; sticky header with cert-gate status pill; cert cards with DSR/edge/sign-test; per-category P&L table; hover tooltip on NAV chart | **shipped** |
+
+### Architecture: what the cert gate actually does
+
+```
+strategy_certificates (SQLite)
+        │
+        │  on startup, when ENABLE_CERTIFICATE_GATE=1
+        ▼
+main.py builds set of categories where enabled=1
+        │
+        │  passed into CombinedTrader.certified_categories
+        ▼
+CombinedTrader.on_signal(category=...)
+   if certified_categories is not None and category not in it:
+       log("combined_trade_skip_uncertified_category"); return
+   else: continue to all other gates (selective, smart_money,
+         BOCPD, edge sanity, fee buffer, daily loss kill, ...)
+```
+
+Three-tier rollback:
+1. **Soft** (1 SQL line): `UPDATE strategy_certificates SET
+   enabled=0 WHERE name='...'` disables a single cert without
+   touching code.
+2. **Medium** (1 env var): `ENABLE_CERTIFICATE_GATE=0` falls back
+   to legacy "trade everything that passes the other gates".
+3. **Hard**: `git revert e411cfc` removes the wiring entirely.
+
+The default in production is `ENABLE_CERTIFICATE_GATE=0` — opt-in
+only, so existing deployments keep current behaviour until a
+deliberate flip.
+
+### Honest caveat on the certification
+
+`combiner_v2.joblib` was saved with `--allow-regression` because no
+v1 forward-metric existed to compare against. The first batch of
+live `sports_global` fills *is* the production verification. The
+falsifiable claim:
+
+> +0.128 log-loss edge on `sports_global` should translate to
+> realized PnL within 1σ of `+0.128 × n × notional` across the
+> first 20-30 fills. If cumulative edge tracks; cert is real. If
+> flat or negative across 20+ fills; disable via the SQL one-liner.
+
+626 head-to-head rows is enough for DSR but tight for production
+confidence. The forward fills are themselves a held-out test.
+
+### Empirical state at session end
+
+```
+NAV (mid):              $9,995.49  (−0.05% over the session, before activation)
+Realized P&L:           +$199.42
+Open positions:         38
+Historical fills:       151
+Settled with position:  7 (all NO-side, all paid out)
+Strategy certificates:  3 rows total
+                          - stat_lgbm_combiner_sports_global_v2 (enabled=1)
+                          - stat_lgbm_combiner_sports_global    (enabled=0, superseded)
+                          - stat_lgbm                           (enabled=0, overall)
+Cert gate at run time:  ON, allowlist = {sports_global}
+Bot status:             running on worktree code, cert gate active
+```
+
+### Discipline takeaway
+
+This session is the inverse of week 4: there's the discipline to
+ship something AND the discipline to scope it tight. The model
+**doesn't** beat the market overall (correctly, falsifiably,
+recorded as an enabled=0 cert). The model **does** beat the market
+on `sports_global` (8/8 folds, p=0.004). Live trading was
+restricted to that one category, with a SQL-level kill switch and an
+env-flag rollback. This is what "ship narrow when you're sure, log
+broadly when you're not" looks like in code.
+
+The next forward-test is purely passive: let `sports_global` fills
+land, see if cumulative edge tracks the +0.128 log-loss claim. If
+it does, audit `news_keyword_match` next (same recipe: backfill
+`p_news_match`, calibrate, look for category sub-slices that
+beat market). If not, disable the cert and the gate falls back to
+the empty allowlist with no further code changes.
+
+### Files added / modified
+
+```
+polyagent/config.py                       +9    enable_certificate_gate flag,
+                                                DB_PATH/LOG_PATH overrides
+polyagent/main.py                        +30    bootstrap certified_categories
+                                                allowlist from strategy_certificates
+                                                on startup
+polyagent/strategies/combined_trader.py  +19    certified_categories field +
+                                                early-return gate in on_signal
+polyagent/dashboard.py                  +504/-85 cert panel, by-cat rollup,
+                                                better NAV chart, /api/certificates,
+                                                /api/by-category
+tests/test_certificate_gate.py           +new   4 tests covering gate
+data/combiner_v2.joblib                  +new   per-category log-pool combiner
+                                                (gitignored)
+```
+
+Commits: `e411cfc` (cert gate + sports_global cert), `bc98db1`
+(dashboard upgrade).
+
+---
+
 ## Where to look next
 
 If you wanted to spend another week:
