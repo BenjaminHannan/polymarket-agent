@@ -1,13 +1,24 @@
 """Retrieval-augmented LLM forecaster as a 4th combiner expert.
 
 Architecture (Halawi/NeurIPS 2024):
-  question + retrieved news (top-K) -> Phi-4-14B int4 -> N forecasts ->
-  geometric-mean of odds -> p_llm
+  question + retrieved news (top-K) -> LLM -> N forecasts ->
+  geometric-mean of odds -> AIA debias -> p_llm
+
+Default model: openai/gpt-oss-20b (MoE, ~3.6B active params per forward
+pass, ~13 GB MXFP4 on disk and in VRAM). 20B class quality at
+local-inference cost. Override with LLM_FORECASTER_MODEL env to swap to
+Phi-4-mini-instruct (lighter, ~7 GB BF16) or any other HF causal LM.
 
 Default: OFF (set ENABLE_LLM_FORECASTER=1).
-First load downloads ~7 GB. Inference is slow (~10-30 s per market) so
-we trigger this on event creation + news-velocity spikes, not every
-combined_signal poll. Cached per (market_id, news_hash).
+First load downloads the weights (~13 GB for gpt-oss-20b). Inference
+runs at ~5-15 s per market on a 16GB-class GPU at REASONING_EFFORT=low,
+which is what the weather forecaster's 30-min poll cadence assumes.
+
+The chat path uses the harmony format with a system message that sets
+reasoning_effort. Lowering reasoning effort shortens chain-of-thought
+tokens dramatically — we don't need deep deliberation since the prompt
+already carries a structured base rate and event list; the LLM's job
+is synthesis, not search.
 
 DPO self-play fine-tuning (Turtel/Wood/Khoja/Mehl 2025) is the next
 upgrade — add 7-10% relative Brier — but takes 6-12 h of GPU time.
@@ -29,46 +40,72 @@ import structlog
 log = structlog.get_logger()
 
 
-MODEL_ID = os.getenv("LLM_FORECASTER_MODEL", "microsoft/Phi-4-mini-instruct")
-N_SAMPLES = int(os.getenv("LLM_FORECASTER_N_SAMPLES", "6"))
+MODEL_ID = os.getenv("LLM_FORECASTER_MODEL", "openai/gpt-oss-20b")
+N_SAMPLES = int(os.getenv("LLM_FORECASTER_N_SAMPLES", "4"))
 TEMPS: list[float] = [
-    float(t) for t in os.getenv("LLM_FORECASTER_TEMPS", "0.5,0.9").split(",")
+    float(t) for t in os.getenv("LLM_FORECASTER_TEMPS", "0.6,0.9").split(",")
 ]
-MAX_NEW_TOKENS = int(os.getenv("LLM_FORECASTER_MAX_NEW_TOKENS", "300"))
+MAX_NEW_TOKENS = int(os.getenv("LLM_FORECASTER_MAX_NEW_TOKENS", "400"))
+# GPT-OSS reasoning effort: "low" / "medium" / "high". Low keeps the
+# rolling chain-of-thought short so each call is ~3-8s instead of 20-60s.
+# We don't actually need deep reasoning to output a probability — the
+# prompt already carries the structured base rate and event list.
+REASONING_EFFORT = os.getenv("LLM_FORECASTER_REASONING", "low")
 P_CLIP = (0.02, 0.98)
 
 
 _lock = threading.Lock()
-_pipe: Optional[object] = None
+_model = None
+_tokenizer = None
+_load_attempted = False  # latch: if first load failed, don't retry every call
 
 
 def _get_pipe():
-    """Lazy-load the model the first time we forecast."""
-    global _pipe
-    if _pipe is not None:
-        return _pipe
+    """Lazy-load (model, tokenizer) the first time we forecast.
+
+    Returns (model, tokenizer) or (None, None) on failure.
+
+    Switched from the old `transformers.pipeline("text-generation", ...)`
+    path to the explicit (model, tokenizer) pair so we can:
+      - apply chat templates (required for gpt-oss harmony format),
+      - pass a system message that sets reasoning_effort,
+      - read out only the assistant tokens, not the chain-of-thought.
+
+    GPT-OSS-20B loads in ~13 GB MXFP4 on a 16GB-class GPU. Phi-4-mini-
+    instruct (~7GB BF16) still works as the env override.
+    """
+    global _model, _tokenizer, _load_attempted
+    if _model is not None:
+        return _model, _tokenizer
+    if _load_attempted:
+        # Already tried and failed; don't retry on every sample.
+        return None, None
     with _lock:
-        if _pipe is not None:
-            return _pipe
-        from transformers import pipeline
+        if _model is not None:
+            return _model, _tokenizer
+        if _load_attempted:
+            return None, None
+        _load_attempted = True
+        from transformers import AutoModelForCausalLM, AutoTokenizer
         import torch
 
-        device = 0 if torch.cuda.is_available() else -1
-        log.info("llm_forecaster_loading", model=MODEL_ID, device="cuda" if device == 0 else "cpu")
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        log.info("llm_forecaster_loading", model=MODEL_ID, device=device)
         try:
-            _pipe = pipeline(
-                "text-generation",
-                model=MODEL_ID,
-                device=device,
-                torch_dtype=torch.bfloat16 if device == 0 else None,
-                model_kwargs={
-                    "low_cpu_mem_usage": True,
-                },
+            _tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+            _model = AutoModelForCausalLM.from_pretrained(
+                MODEL_ID,
+                torch_dtype="auto",
+                device_map="auto" if device == "cuda" else None,
+                low_cpu_mem_usage=True,
             )
+            _model.eval()
+            log.info("llm_forecaster_ready", model=MODEL_ID, device=device)
         except Exception as e:
-            log.warning("llm_forecaster_load_failed", err=str(e))
-            _pipe = None
-        return _pipe
+            log.warning("llm_forecaster_load_failed", err=str(e), model=MODEL_ID)
+            _model = None
+            _tokenizer = None
+        return _model, _tokenizer
 
 
 _PROB_RE = re.compile(r"\b(\d{1,3})(?:\.(\d+))?\s*%|\b(0?\.\d+)\b")
@@ -185,20 +222,48 @@ class LLMForecaster:
         return os.getenv("ENABLE_LLM_FORECASTER", "0") == "1"
 
     def _generate(self, prompt: str, temperature: float = 0.7) -> str:
-        pipe = _get_pipe()
-        if pipe is None:
+        model, tokenizer = _get_pipe()
+        if model is None or tokenizer is None:
             return ""
         try:
-            out = pipe(
-                prompt,
-                max_new_tokens=self.max_new_tokens,
-                do_sample=True,
-                temperature=temperature,
-                top_p=0.95,
-                num_return_sequences=1,
-                return_full_text=False,
-            )
-            return out[0].get("generated_text", "") if out else ""
+            import torch
+            messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a calibrated probability forecaster. "
+                        f"Reasoning: {REASONING_EFFORT}. "
+                        "Output only the requested 'Probability:' line."
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ]
+            # Try to use the chat template if available (required for
+            # gpt-oss harmony format; works for Phi-4 as well).
+            try:
+                input_ids = tokenizer.apply_chat_template(
+                    messages,
+                    add_generation_prompt=True,
+                    return_tensors="pt",
+                )
+            except Exception:
+                # Fall back to raw prompt for tokenizers without a chat template.
+                input_ids = tokenizer(prompt, return_tensors="pt").input_ids
+            input_ids = input_ids.to(model.device)
+
+            with torch.no_grad():
+                out_ids = model.generate(
+                    input_ids,
+                    max_new_tokens=self.max_new_tokens,
+                    do_sample=True,
+                    temperature=temperature,
+                    top_p=0.95,
+                    pad_token_id=tokenizer.eos_token_id,
+                )
+            # Decode only the newly generated tokens
+            gen = out_ids[0, input_ids.shape[-1]:]
+            text = tokenizer.decode(gen, skip_special_tokens=True)
+            return text
         except Exception as e:
             log.warning("llm_forecaster_generate_failed", err=str(e))
             return ""
