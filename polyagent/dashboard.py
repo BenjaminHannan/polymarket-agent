@@ -49,9 +49,23 @@ log = structlog.get_logger()
 
 
 def _read_only_conn(db_path: str) -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path, timeout=60.0)
+    """Open paper.db in true SQLite read-only mode via URI.
+
+    Under WAL, readers opened with `mode=ro` get snapshot isolation and
+    never block on the writer. The previous implementation opened a
+    read-write connection with a 60s busy_timeout, which still queued
+    behind aiosqlite's hot-path writer on a busy broker and produced
+    10-20s dashboard endpoint latencies. The URI form fixes both.
+
+    `cache=shared` lets multiple read-only handlers across this process
+    reuse the page cache, which helps the dashboard's 8 parallel
+    endpoint hits per page-load.
+    """
+    import os
+    abs_path = os.path.abspath(db_path).replace("\\", "/")
+    uri = f"file:/{abs_path}?mode=ro&cache=shared"
+    conn = sqlite3.connect(uri, uri=True, timeout=10.0)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA busy_timeout=60000")
     return conn
 
 
