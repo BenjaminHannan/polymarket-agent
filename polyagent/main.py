@@ -623,6 +623,39 @@ async def run() -> None:
                 ))
                 log.info("wallet_analytics_loaded", interval_sec=3600)
 
+            # Arb auto-executor (pmwhybetter.md Problem-6 #1).
+            # Polls monotonicity_arb + NegRisk sum-to-1 + in-play detectors
+            # at 5-sec cadence and places multi-leg baskets via broker.submit().
+            # Bypasses the cert gate because arbitrage is mathematically
+            # risk-free when executable. IMDEA AFT 2025 cites $40M extracted
+            # by this constraint family in 2024-25. Disabled when
+            # ENABLE_ARB_EXECUTOR=0.
+            if os.getenv("ENABLE_ARB_EXECUTOR", "1") == "1":
+                from polyagent.strategies.arb_executor import ArbExecutor
+                _arb_exec = ArbExecutor(
+                    broker=broker,
+                    book_store=book_store,
+                    markets=markets,
+                    poll_sec=float(os.getenv("ARB_POLL_SEC", "5")),
+                    cooldown_sec=float(os.getenv("ARB_COOLDOWN_SEC", "60")),
+                    negrisk_min_bps=float(os.getenv("ARB_NEGRISK_MIN_BPS", "50")),
+                    monotonicity_min_bps=float(os.getenv("ARB_MONO_MIN_BPS", "30")),
+                    inplay_late_game_min_bps=float(os.getenv("ARB_INPLAY_LATE_BPS", "10")),
+                    inplay_default_min_bps=float(os.getenv("ARB_INPLAY_DEFAULT_BPS", "20")),
+                    min_leg_size=float(os.getenv("ARB_MIN_LEG_SIZE", "50")),
+                    max_basket_notional=float(os.getenv("ARB_MAX_BASKET_NOTIONAL", "200")),
+                )
+                tasks.append(_spawn(
+                    "arb_executor",
+                    lambda: _arb_exec.run(),
+                ))
+                log.info(
+                    "arb_executor_loaded",
+                    poll_sec=_arb_exec.poll_sec,
+                    negrisk_min_bps=_arb_exec.negrisk_min_bps,
+                    monotonicity_min_bps=_arb_exec.monotonicity_min_bps,
+                )
+
             # Foreign-language news poller (pmwhybetter.md Problem-3 #5).
             # Polls Le Monde, Folha SP, NHK World, Der Spiegel, Xinhua and
             # routes through the existing LLMForecaster for translation
