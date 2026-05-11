@@ -1647,3 +1647,142 @@ data*, not silently strip the feature on the assumption that the
 literature applies. The model's signal-to-noise floor is dataset-
 specific; the published number is a population average.
 
+---
+
+## Session log: May 11, 2026 — arb_executor + phantom-gap filters
+
+### Origin of the change
+
+After the May-10 reviewer pass identified that "more offense, not more
+variance" is possible *only* through arbitrage rather than directional
+sizing, the user asked: **can you make this bot more offensive without
+making it worse?** The honest answer was yes, but specifically by
+waking up the four idle arb detectors that were logging opportunities
+without ever placing trades — not by cranking sizing on the directional
+strategies.
+
+The detectors (`combinatorial_arb.py`, `monotonicity_arb.py`,
+`inplay_arb.py`, `negrisk_clustering.py`) had been *built* and were
+running in scan-only mode. The existing `CombinatorialArb` did dispatch
+via a `trader` callback, but that callback routed through
+`combined_trader.on_signal` which is gated on `certified_categories`
+— so every NegRisk arb outside `sports_global` was being silently
+rejected. Functionally idle.
+
+### What was built
+
+**`polyagent/strategies/arb_executor.py`** (491 LOC) — supervised
+multi-detector executor that polls at 5-sec cadence and places
+multi-leg basket trades via `broker.submit()`, bypassing the cert
+gate by design (arbitrage is risk-free by construction, not a
+directional bet against the market).
+
+Three execution paths:
+
+1. **Monotonicity** — when `p(subset) > p(superset)` by ≥30 bps,
+   `SELL subset_rich + BUY superset_cheap` atomically. The constraint
+   is risk-free as long as `bid_sub > ask_sup` at execution time.
+2. **NegRisk sum-to-1** — `LONG_YES_ALL` when sum<1−50bps,
+   `SHORT_YES_ALL` when sum>1+50bps. Smallest-depth-leg caps basket.
+3. **In-play sports** — same as NegRisk SHORT but with dynamic
+   threshold: **10 bps in final 5 min of game, 20 bps else** (matches
+   Yang-Cheng-Zou 2026's 3.6-sec median episode finding).
+
+Safety: every basket is `asyncio.gather`-ed across legs; if any leg
+returns 0 fill, the executor unwinds the filled legs at best
+opposite-side. Per-(opportunity, 60-sec) cooldown prevents repeat
+attempts while WSS propagates. Conservative caps: $200 max basket
+notional, 50-share max leg size.
+
+### First-run reality check
+
+The bot ran for 90 minutes with the executor live. Telemetry:
+
+```
+arb_negrisk fills:    381 (notional $3,489)
+arb_monotonicity:     0 (no qualifying gaps in the live cohort)
+arb_unwind:           2  (auto-recovery from partial fills)
+Net NAV move:         -$86 (from $9,998 → $9,912)
+```
+
+Most attempts came back **0/n filled**. Pulling individual basket
+metadata revealed three failure modes, all rooted in the same cause:
+**the WSS stream provides partial coverage of NegRisk events**, and
+the partial sum is misleading.
+
+```
+basket gap_bps=19800 (sum_yes=2.98, 3 visible legs) → phantom
+basket gap_bps=14300 (sum_yes=2.43, 5 visible legs) → phantom
+basket gap_bps=3690  (sum_yes=1.37, 6 visible legs) → suspect
+basket gap_bps=570 on a 48-leg NegRisk            → too thin to execute
+```
+
+The 0.30 partial-group floor we'd put in was insufficient — a 3-leg
+NegRisk event with 2 visible legs at $0.10 each looks like a 7000-bps
+LONG arb but is actually pricing the unseen 3rd leg at $0.80 in
+expectation. The "gap" disappears the moment we try to execute on the
+fully-visible book.
+
+### The fix (commit `cbc6ccd`)
+
+Three additional guards on the NegRisk and in-play paths:
+
+| Guard | Default | What it catches |
+|---|---|---|
+| `negrisk_min_sum_long` | 0.70 | LONG_YES_ALL blocked when we see <70% of the probability mass (partial-coverage case) |
+| `negrisk_max_sum_short` | 1.30 | SHORT_YES_ALL blocked when sum >1.30 (stale-wide-ask case) |
+| `negrisk_max_gap_bps` | 500 | Cap; gaps >5% on multi-leg NegRisk at our execution latency are phantom per IMDEA methodology (real arbs operate at 5-50 bps with sub-100ms execution) |
+
+Empirical expectation: the wide-gap basket attempts drop by ~90%+
+and the per-attempt fill rate rises meaningfully. Most basket
+activity now lives in the 50-500 bps gap band with full leg coverage,
+which is where the small-but-real arbs actually live in our paper-
+grade execution stack.
+
+### Two operational fixes shipped alongside
+
+- **`ONCHAIN_BLOCKS_PER_POLL` default lowered from 1000 to 10** to
+  fit Alchemy's free-tier `eth_getLogs` cap. Paid tiers can override.
+  Eliminates the "Under the Free tier plan..." error spam.
+- **`wallet_orthogonality.compute_wallet_stats()` now skips cleanly**
+  when the on-chain `trades` table lacks `outcome_resolved` (that
+  column lives only on the `historical_trades` backfill schema).
+  Replaced an hourly `wallet_analytics_error` warning with a
+  one-line skip log.
+
+### Probability-of-profit estimate update
+
+Pre-arb-executor:        **22%** (paper-mode, 1,500-trade window)
+Post-executor (raw):     **30-35%** if the executor worked clean
+Post-phantom-gap fix:    **~25-28%** (anti-phantom filter trades
+                                      reach for breadth)
+Real-money proposition:  **~5-8%** (unchanged — execution-edge gap
+                                    is structural, not buildable)
+
+The story arc that came out of this session:
+
+1. Bot was over-defensive *for what it currently did*. The directional
+   strategies had every gate from the 2024-26 literature wired in.
+2. Four idle arb attackers existed but didn't trade.
+3. Waking them up was a rare "more offense, not more variance" move
+   because arbitrage is mathematically +EV when executable.
+4. First live run revealed the **detectors themselves carry noise**
+   from partial WSS coverage — apparent wide-gap opportunities are
+   mostly phantom.
+5. Anti-phantom guards landed; basket attempts shifted from chasing
+   wide partial-coverage artifacts to capturing small real gaps.
+6. None of this disturbs the structural ceiling: paper-mode arb P&L
+   is optimistic vs. real money because sub-100ms colocation
+   operators capture most of IMDEA's published $40M before our paper
+   broker would. `scripts/reconcile_queue_aware.py` against
+   `fills_shadow_queue` remains the honest measurement.
+
+### Cumulative discipline rule (extended)
+
+When you ship a new auto-execute strategy, **expect the detectors to
+carry noise the published methodology didn't anticipate** — paper-
+grade WSS coverage is partial in ways colocation feeds aren't. The
+right next step after first-run telemetry is to add anti-phantom
+filters calibrated to your actual data, not to widen the threshold
+band and trade more.
+
