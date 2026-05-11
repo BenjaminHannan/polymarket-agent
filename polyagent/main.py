@@ -689,7 +689,10 @@ async def run() -> None:
                     lambda: run_onchain_ingester(
                         settings.db_path,
                         poll_sec=float(os.getenv("ONCHAIN_POLL_SEC", "60")),
-                        blocks_per_poll=int(os.getenv("ONCHAIN_BLOCKS_PER_POLL", "1000")),
+                        # Alchemy's free tier caps eth_getLogs at 10 blocks
+                        # per call. The 10-block default keeps us inside
+                        # that limit; paid tiers can override via env.
+                        blocks_per_poll=int(os.getenv("ONCHAIN_BLOCKS_PER_POLL", "10")),
                         max_blocks_lookback=int(os.getenv("ONCHAIN_MAX_LOOKBACK", "10000")),
                     ),
                 ))

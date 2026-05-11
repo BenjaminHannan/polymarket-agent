@@ -131,6 +131,17 @@ def compute_wallet_stats(
     winning side.
     """
     ensure_table(conn)
+    # Defensive: the on-chain ingester schema doesn't include
+    # `outcome_resolved` (that column only lives on the historical_trades
+    # backfill table). If the column is missing, skip cleanly rather than
+    # crash. The wallet-orthogonality test needs *resolved* trades to
+    # compute win rates; with a trades table that's only on-chain rows
+    # we don't have resolution data yet and there's nothing to compute.
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(trades)")}
+    if "outcome_resolved" not in cols:
+        log.info("wallet_orthogonality_skip_no_outcome_column",
+                 cols=sorted(cols))
+        return []
     rows = conn.execute(
         f"""SELECT wallet,
                   SUM(CASE

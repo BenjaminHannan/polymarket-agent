@@ -105,6 +105,18 @@ class ArbExecutor:
     inplay_default_min_bps: float = 20.0
     min_leg_size: float = 50.0
     max_basket_notional: float = 200.0  # USD per basket — small while paper-validating
+    # Anti-phantom-gap guards (added after first run revealed the wide-gap
+    # opportunities are mostly partial-group artifacts on the WSS stream).
+    # Real NegRisk arbs at the IMDEA-published $40M scale operate at 5-50
+    # bps with sub-100ms execution — gaps over `negrisk_max_gap_bps` are
+    # almost always phantom (we're seeing 2 of 5+ legs and the partial
+    # sum is misleading). Similarly, demand we see at least 70% of the
+    # probability mass for LONG_YES_ALL (sum ≥ 0.70) and the symmetric
+    # bound for SHORT_YES_ALL (sum ≤ 1.30) so partial-coverage doesn't
+    # masquerade as a real gap.
+    negrisk_max_gap_bps: float = 500.0
+    negrisk_min_sum_long: float = 0.70
+    negrisk_max_sum_short: float = 1.30
     # In-play: provide a list of NegRisk groups with game-window metadata
     # via the constructor. Empty = in-play scanner is a no-op.
     inplay_groups: list[dict] = field(default_factory=list)
@@ -212,6 +224,21 @@ class ArbExecutor:
                 gap_bps = (1.0 - sum_yes) * 10_000.0
                 if gap_bps < self.negrisk_min_bps:
                     continue
+                # Anti-phantom-gap: require we see ≥70% of the probability
+                # mass and that the gap isn't suspiciously wide.
+                if sum_yes < self.negrisk_min_sum_long:
+                    log.info(
+                        "arb_skip_partial_long",
+                        event_id=event_id, sum_yes=round(sum_yes, 3),
+                        gap_bps=round(gap_bps, 1),
+                    )
+                    continue
+                if gap_bps > self.negrisk_max_gap_bps:
+                    log.info(
+                        "arb_skip_phantom_gap_long",
+                        event_id=event_id, gap_bps=round(gap_bps, 1),
+                    )
+                    continue
                 await self._execute_negrisk_basket(
                     event_id, asks, direction="LONG_YES_ALL",
                     gap_bps=gap_bps,
@@ -219,6 +246,19 @@ class ArbExecutor:
             elif sum_yes > 1.0:
                 gap_bps = (sum_yes - 1.0) * 10_000.0
                 if gap_bps < self.negrisk_min_bps:
+                    continue
+                if sum_yes > self.negrisk_max_sum_short:
+                    log.info(
+                        "arb_skip_partial_short",
+                        event_id=event_id, sum_yes=round(sum_yes, 3),
+                        gap_bps=round(gap_bps, 1),
+                    )
+                    continue
+                if gap_bps > self.negrisk_max_gap_bps:
+                    log.info(
+                        "arb_skip_phantom_gap_short",
+                        event_id=event_id, gap_bps=round(gap_bps, 1),
+                    )
                     continue
                 await self._execute_negrisk_basket(
                     event_id, asks, direction="SHORT_YES_ALL",
@@ -407,6 +447,18 @@ class ArbExecutor:
         but with the late-game flag for telemetry."""
         key = f"inplay:{arb.condition_id}:{int(arb.detected_ts)}"
         if not self._cooldown_ok(key):
+            return
+        # Apply the same anti-phantom-gap guards as the NegRisk scanner:
+        # in-play arbs at the published sub-second rates operate at 10-50
+        # bps, not 500+; wide gaps are partial-coverage artifacts.
+        if arb.bps_gap > self.negrisk_max_gap_bps:
+            log.info("arb_skip_phantom_gap_inplay",
+                     condition_id=arb.condition_id, gap_bps=round(arb.bps_gap, 1))
+            return
+        if arb.sum_yes_prices > self.negrisk_max_sum_short:
+            log.info("arb_skip_partial_inplay",
+                     condition_id=arb.condition_id,
+                     sum_yes=round(arb.sum_yes_prices, 3))
             return
         leg_size = min(self.min_leg_size, arb.min_leg_size_at_stale)
         if leg_size < self.min_leg_size:
