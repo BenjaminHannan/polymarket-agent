@@ -623,6 +623,61 @@ async def run() -> None:
                 ))
                 log.info("wallet_analytics_loaded", interval_sec=3600)
 
+            # Polymarket Liquidity Rewards API poller (May-11 autoresearch:
+            # CLOB v2 launched April 28, 2026 with a $1M pool; we poll
+            # eligibility + per-market pool size every 30 min).
+            if os.getenv("ENABLE_POLYMARKET_REWARDS", "1") == "1":
+                from polyagent.data.polymarket_liquidity_rewards import (
+                    run_rewards_poller,
+                )
+                tasks.append(_spawn(
+                    "polymarket_liquidity_rewards",
+                    lambda: run_rewards_poller(
+                        settings.db_path,
+                        markets=markets,
+                        poll_sec=float(os.getenv("REWARDS_POLL_SEC", "1800")),
+                    ),
+                ))
+                log.info("polymarket_liquidity_rewards_loaded",
+                         n_markets=len(markets))
+
+            # Magamyman pattern detector (May-11 autoresearch: highest-
+            # conviction subset of the Mitts-Ofir screen; the Iran-strike
+            # canonical case had a 71-minute lead at 17% implied prob).
+            # Runs hourly, flags super_signal=1 in the M-O watchlist so
+            # the copy-trader doubles its copy fraction on those pairs.
+            if os.getenv("ENABLE_MAGAMYMAN_DETECTOR", "1") == "1":
+                import sqlite3 as _sqlite3_mm
+                async def _magamyman_loop():
+                    from polyagent.signals.magamyman_pattern import (
+                        detect_candidates, flag_in_watchlist,
+                    )
+                    while True:
+                        try:
+                            conn = _sqlite3_mm.connect(
+                                settings.db_path, timeout=30.0
+                            )
+                            try:
+                                conn.execute("PRAGMA busy_timeout=30000")
+                                cands = detect_candidates(conn)
+                                n = flag_in_watchlist(conn, cands) if cands else 0
+                                log.info(
+                                    "magamyman_scan_done",
+                                    n_candidates=len(cands),
+                                    n_flagged=n,
+                                )
+                            finally:
+                                conn.close()
+                        except Exception as e:
+                            log.warning("magamyman_scan_error", err=str(e))
+                        await asyncio.sleep(3600.0)
+
+                tasks.append(_spawn(
+                    "magamyman_pattern_detector",
+                    lambda: _magamyman_loop(),
+                ))
+                log.info("magamyman_detector_loaded", interval_sec=3600)
+
             # Polymarket native-endpoint feature poller (May-11 Strategy #10).
             # Polls comment count, top-trader inflow, and 1h unique-trader
             # count for every market on a 5-min cadence. Features are

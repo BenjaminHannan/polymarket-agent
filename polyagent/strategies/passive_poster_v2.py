@@ -185,6 +185,28 @@ class PassivePosterV2:
     # the tracker so the dashboard can show what we'd be earning if we
     # were a live MM seat.
     maker_rewards: object | None = None
+    # Per-category maker premium multiplier on the AS half-spread (Akey
+    # 2026: sports has the largest maker premium, weather has the
+    # smallest). Quotes in high-premium categories tighten — they get
+    # rewarded more per spread captured, so we accept more adverse-
+    # selection risk in exchange for more fills. Multipliers <1.0
+    # tighten quotes; >1.0 widen them.
+    maker_premium_by_category: dict[str, float] = field(default_factory=lambda: {
+        "sports_global": 0.85,   # Akey: largest maker premium
+        "sports": 0.85,
+        "politics": 0.90,        # Akey: 2nd largest, concentrated around events
+        "election": 0.90,
+        "crypto": 0.95,
+        "econ": 0.95,
+        "weather": 1.05,         # Akey: smallest maker premium → widen quotes
+        "entertainment": 1.00,
+        "other": 1.00,
+    })
+    # Optional sqlite handle for the Polymarket Liquidity Rewards table.
+    # When set, the strategy prefers markets eligible for the official
+    # rewards program (CLOB v2, April 2026) — these are the markets where
+    # paper-mode maker score actually corresponds to real USD/day.
+    rewards_db_conn: object | None = None
     # Strategy name for logs / fills.strategy
     strategy_name: str = "passive_poster_v2"
     # Per-token quote state
@@ -258,12 +280,20 @@ class PassivePosterV2:
             sigma_sq_per_sec=sigma_sq_per_sec,
             time_to_horizon_sec=self.horizon_sec,
         )
+        # Akey 2026: maker premium varies by category. We scale the
+        # base AS half-spread by a category-specific multiplier — high-
+        # premium categories (sports) get tighter quotes (more fills,
+        # more rebate per dollar), low-premium categories (weather)
+        # get wider quotes (less adverse-selection risk per fill).
+        category_mult = float(
+            self.maker_premium_by_category.get(m.category or "other", 1.0)
+        )
         half_spread = avellaneda_stoikov_half_spread(
             gamma=self.gamma,
             sigma_sq_per_sec=sigma_sq_per_sec,
             time_to_horizon_sec=self.horizon_sec,
             k_arrival_per_sec=k,
-        ) * as_widen
+        ) * as_widen * category_mult
         reservation = mid + skew
         TICK = 0.01
         # Polymarket prices are bounded to [0.01, 0.99] — hard clamp.

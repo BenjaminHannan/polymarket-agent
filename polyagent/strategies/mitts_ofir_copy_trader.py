@@ -79,6 +79,11 @@ class MittsOfirCopyTrader:
     copy_fraction: float = 0.25
     max_per_trade_usd: float = 100.0
     cooldown_sec: float = 60.0
+    # Super-signal boost: when the Magamyman-pattern detector flags a
+    # (wallet, asset) pair (fresh wallet + extreme-low price + large
+    # notional + near-first trade), the copy fraction gets multiplied
+    # by this number. Default 2.0 → from 25% to 50% copy.
+    super_signal_multiplier: float = 2.0
     # State
     _pending: deque = field(default_factory=lambda: deque(maxlen=2000))
     _recent_cooldown: dict = field(default_factory=dict)
@@ -149,9 +154,26 @@ class MittsOfirCopyTrader:
             side = await self._infer_side(wallet, asset)
             if side is None:
                 continue
+            # Magamyman super-signal: if the Magamyman pattern detector
+            # marked this (wallet, asset) pair as super_signal=1, boost
+            # the copy fraction. The pattern catches fresh-wallet +
+            # extreme-low-price + large-notional + pre-event-timing
+            # entries — the highest-conviction subset of the M-O screen.
+            effective_fraction = float(self.copy_fraction)
+            try:
+                from polyagent.signals.magamyman_pattern import is_super_signal
+                if is_super_signal(self.screen_db_conn, wallet, asset):
+                    effective_fraction *= float(self.super_signal_multiplier)
+                    log.info(
+                        "mo_super_signal_boost",
+                        wallet=wallet[:14], asset=asset[:14],
+                        boost=self.super_signal_multiplier,
+                    )
+            except Exception:
+                pass
             notional = min(
                 self.max_per_trade_usd,
-                float(size_obs) * float(self.copy_fraction),
+                float(size_obs) * effective_fraction,
             )
             if notional < 1.0:
                 continue

@@ -186,6 +186,15 @@ def live_features(question: str, snap: BookSnapshot, *, liquidity: float = 0.0, 
         feats["mkt_longshot_yes"] = 1.0 if snap.yes_mid <= 0.10 else 0.0
         feats["mkt_favorite_yes"] = 1.0 if snap.yes_mid >= 0.90 else 0.0
         feats["mkt_midrange_yes"] = 1.0 if 0.40 <= snap.yes_mid <= 0.60 else 0.0
+        # Akey 2026 finding: 63% of all Polymarket trades happen at
+        # extreme prices (<10c or >90c) where spread is largest as %
+        # of stake. Wider "extreme band" feature captures the broader
+        # longshot zone where adverse-selection from retail is highest.
+        feats["mkt_in_extreme_band"] = (
+            1.0 if (snap.yes_mid <= 0.15 or snap.yes_mid >= 0.85) else 0.0
+        )
+        # Distance from 0.50 — proxy for trade-cost-as-fraction-of-stake
+        feats["mkt_distance_from_half"] = float(abs(snap.yes_mid - 0.50))
     if snap.yes_spread is not None:
         feats["mkt_spread"] = float(snap.yes_spread)
 
