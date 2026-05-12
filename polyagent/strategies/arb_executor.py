@@ -117,6 +117,16 @@ class ArbExecutor:
     negrisk_max_gap_bps: float = 500.0
     negrisk_min_sum_long: float = 0.70
     negrisk_max_sum_short: float = 1.30
+    # Semantic NegRisk: when set to an LLM forecaster + sqlite handle,
+    # the executor also scans semantically-clustered markets (Saguillo
+    # AFT 2025 methodology) for *implicit* NegRisk groups that don't
+    # share an event_id. Polls less aggressively because semantic
+    # clustering is expensive (bge embeddings + LLM relationship check).
+    semantic_llm_forecaster: object | None = None
+    semantic_db_conn: object | None = None
+    semantic_poll_interval_sec: float = 600.0   # 10 min
+    semantic_similarity_threshold: float = 0.85
+    _semantic_last_scan_ts: float = 0.0
     # In-play: provide a list of NegRisk groups with game-window metadata
     # via the constructor. Empty = in-play scanner is a no-op.
     inplay_groups: list[dict] = field(default_factory=list)
@@ -155,10 +165,17 @@ class ArbExecutor:
     async def _scan_and_execute(self) -> None:
         # 1) Monotonicity arbs (cheap, deterministic detection)
         await self._scan_monotonicity()
-        # 2) NegRisk sum-to-1
+        # 2) NegRisk sum-to-1 (event-id-grouped, fast)
         await self._scan_negrisk()
         # 3) In-play (late-game-aware threshold)
         await self._scan_inplay()
+        # 4) Semantic NegRisk (Saguillo AFT 2025; expensive, scans on
+        #    `semantic_poll_interval_sec` cadence, not every poll_sec)
+        if (self.semantic_llm_forecaster is not None
+                and time.time() - self._semantic_last_scan_ts
+                    >= self.semantic_poll_interval_sec):
+            await self._scan_semantic_negrisk()
+            self._semantic_last_scan_ts = time.time()
 
     # ── Detector → executor adapters ────────────────────────────────────
     async def _scan_monotonicity(self) -> None:
@@ -300,6 +317,110 @@ class ArbExecutor:
                 if a.min_leg_size_at_stale < self.min_leg_size:
                     continue
                 await self._execute_inplay_basket(a, late_game=False)
+
+    async def _scan_semantic_negrisk(self) -> None:
+        """Saguillo AFT 2025 implicit-NegRisk: discover groups of markets
+        that are *semantically* mutually-exclusive-exhaustive even
+        though they don't share an event_id. Embeds question text via
+        bge-large, clusters by cosine ≥ similarity_threshold, asks the
+        LLM to confirm MEE, then executes if the cluster's sum-of-YES
+        violates the constraint (subject to the same anti-phantom
+        guards as `_scan_negrisk`).
+
+        Cost: bge embeds N markets + 1 LLM call per cluster. We rate-
+        limit via `semantic_poll_interval_sec` (10 min default).
+        """
+        try:
+            from polyagent.signals.negrisk_clustering import (
+                scan_negrisk_clusters, detect_arb_candidates,
+            )
+        except ImportError:
+            return
+        # Build the live snapshot list — only markets with both YES
+        # books and a fresh ask are eligible.
+        snapshot = []
+        for m in self.markets:
+            book = self.book_store.books.get(m.yes_token_id)
+            if book is None:
+                continue
+            ask = book.best_ask()
+            if ask is None:
+                continue
+            snapshot.append(_PricedMarket(
+                token_id=m.yes_token_id,
+                question=m.question,
+                yes_price=float(ask[0]),
+                condition_id=m.condition_id,
+                category=getattr(m, "category", "") or "",
+            ))
+        if len(snapshot) < 4:
+            return
+        try:
+            clusters = await scan_negrisk_clusters(
+                snapshot,
+                similarity_threshold=self.semantic_similarity_threshold,
+                llm_forecaster=self.semantic_llm_forecaster,
+                conn=self.semantic_db_conn,
+            )
+        except Exception as e:
+            log.warning("arb_semantic_scan_failed", err=str(e))
+            return
+        # Filter for executable: gap >= min_bps, all legs within band,
+        # min leg size at the stale prices.
+        def _leg_size_lookup(token_id: str) -> float:
+            book = self.book_store.books.get(token_id)
+            if book is None:
+                return 0.0
+            ask = book.best_ask()
+            return float(ask[1]) if ask else 0.0
+        arbs = detect_arb_candidates(
+            clusters,
+            min_arb_gap=self.negrisk_min_bps / 10_000.0,
+            min_leg_size=self.min_leg_size,
+            leg_size_lookup=_leg_size_lookup,
+        )
+        for c in arbs:
+            # Apply the anti-phantom guards to semantic clusters too
+            if c.arb_gap > self.negrisk_max_gap_bps / 10_000.0:
+                continue
+            if c.sum_yes < self.negrisk_min_sum_long and c.sum_yes < 1.0:
+                continue
+            if c.sum_yes > self.negrisk_max_sum_short:
+                continue
+            # Convert cluster back into the (market, ask_price, ask_size)
+            # tuple shape used by _execute_negrisk_basket.
+            asks = []
+            tokens_by_id = {m.yes_token_id: m for m in self.markets}
+            for tok_id, p in zip(c.token_ids, c.yes_prices):
+                m = tokens_by_id.get(tok_id)
+                if m is None:
+                    asks = None
+                    break
+                book = self.book_store.books.get(tok_id)
+                if book is None:
+                    asks = None
+                    break
+                ask = book.best_ask()
+                if ask is None:
+                    asks = None
+                    break
+                asks.append((m, float(ask[0]), float(ask[1])))
+            if asks is None or len(asks) < 2:
+                continue
+            direction = "LONG_YES_ALL" if c.sum_yes < 1.0 else "SHORT_YES_ALL"
+            gap_bps = c.arb_gap * 10_000.0
+            log.info(
+                "arb_semantic_cluster_executable",
+                cluster_id=c.cluster_id,
+                sum_yes=round(c.sum_yes, 3),
+                gap_bps=round(gap_bps, 1),
+                n_legs=len(asks),
+                confidence=round(c.confidence, 2),
+            )
+            await self._execute_negrisk_basket(
+                f"semantic:{c.cluster_id}", asks,
+                direction=direction, gap_bps=gap_bps,
+            )
 
     # ── Execution primitives ────────────────────────────────────────────
     async def _execute_monotonicity_pair(self, candidate) -> None:

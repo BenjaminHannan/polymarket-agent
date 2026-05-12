@@ -171,6 +171,11 @@ class BookSnapshot:
     # When provided, live_features() pulls these features in addition to
     # the legacy mid/spread/longshot triple.
     yes_book: object | None = None
+    # Optional condition_id + sqlite handle so live_features() can pull
+    # Polymarket native-endpoint features (comment-count delta, top-trader
+    # 24h net inflow, 1h unique traders) from the polled cache table.
+    condition_id: str | None = None
+    native_features_conn: object | None = None
 
 
 def live_features(question: str, snap: BookSnapshot, *, liquidity: float = 0.0, volume: float = 0.0) -> dict[str, float]:
@@ -216,5 +221,26 @@ def live_features(question: str, snap: BookSnapshot, *, liquidity: float = 0.0, 
         except Exception:
             # Don't let feature extraction errors crash the predictor — we
             # silently drop the microstructure features.
+            pass
+
+    # Polymarket native-endpoint features (Strategy #10 from the May-11
+    # research playbook): comment-count delta as a retail-attention
+    # proxy, top-trader 24h net inflow as a smart-money flow proxy,
+    # 1h unique-trader count as a market-activity proxy. All sourced
+    # from the polled cache in `polymarket_native_features` so the
+    # signal-eval path doesn't hit the API.
+    if snap.native_features_conn is not None and snap.condition_id:
+        try:
+            from polyagent.data.polymarket_native import lookup_features
+            nf = lookup_features(snap.native_features_conn, snap.condition_id)
+            if nf is not None:
+                feats["mkt_comment_count_delta_6h"] = float(nf.comment_count_delta_6h)
+                feats["mkt_top_trader_inflow_24h"] = float(nf.top_trader_inflow_24h)
+                feats["mkt_unique_traders_1h"] = float(nf.unique_traders_1h)
+                # Log-scaled versions for the LGBM
+                import math as _m
+                feats["mkt_log_comment_count_6h"] = float(_m.log1p(max(0, nf.comment_count_6h)))
+                feats["mkt_log_unique_traders_1h"] = float(_m.log1p(max(0, nf.unique_traders_1h)))
+        except Exception:
             pass
     return feats

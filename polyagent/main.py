@@ -623,6 +623,70 @@ async def run() -> None:
                 ))
                 log.info("wallet_analytics_loaded", interval_sec=3600)
 
+            # Polymarket native-endpoint feature poller (May-11 Strategy #10).
+            # Polls comment count, top-trader inflow, and 1h unique-trader
+            # count for every market on a 5-min cadence. Features are
+            # consumed via BookSnapshot.native_features_conn in features.py.
+            if os.getenv("ENABLE_POLYMARKET_NATIVE", "1") == "1":
+                from polyagent.data.polymarket_native import run_native_poller
+                tasks.append(_spawn(
+                    "polymarket_native_poller",
+                    lambda: run_native_poller(
+                        settings.db_path,
+                        markets=markets,
+                        poll_sec=float(os.getenv("NATIVE_POLL_SEC", "300")),
+                    ),
+                ))
+                log.info("polymarket_native_poller_loaded", n_markets=len(markets))
+
+            # M&O 5-signal insider-wallet screen + periodic refresh.
+            # Computes the watchlist hourly from the trades table; the
+            # copy-trader strategy below reads it.
+            if os.getenv("ENABLE_MITTS_OFIR", "1") == "1":
+                import sqlite3 as _sqlite3_mo
+                async def _mo_refresh_loop():
+                    from polyagent.signals.mitts_ofir_screen import compute_and_persist
+                    while True:
+                        try:
+                            conn = _sqlite3_mo.connect(settings.db_path, timeout=30.0)
+                            try:
+                                conn.execute("PRAGMA busy_timeout=30000")
+                                n = compute_and_persist(conn, top_pct=0.01)
+                                log.info("mitts_ofir_refresh_done", watchlist_size=n)
+                            finally:
+                                conn.close()
+                        except Exception as e:
+                            log.warning("mitts_ofir_refresh_error", err=str(e))
+                        await asyncio.sleep(3600.0)
+
+                tasks.append(_spawn("mitts_ofir_screen", lambda: _mo_refresh_loop()))
+                log.info("mitts_ofir_screen_loaded", interval_sec=3600)
+
+                # M&O copy-trader: paper-trades on a 15-min lag after a
+                # watch-list wallet adds ≥$500 to a position.
+                from polyagent.strategies.mitts_ofir_copy_trader import (
+                    MittsOfirCopyTrader,
+                )
+                _mo_conn = _sqlite3_mo.connect(settings.db_path, timeout=30.0)
+                _mo_conn.execute("PRAGMA busy_timeout=30000")
+                _mo_trader = MittsOfirCopyTrader(
+                    broker=broker,
+                    markets_by_asset={m.yes_token_id: m for m in markets},
+                    screen_db_conn=_mo_conn,
+                    poll_sec=float(os.getenv("MO_COPY_POLL_SEC", "60")),
+                    lag_sec=float(os.getenv("MO_COPY_LAG_SEC", "900")),
+                    min_position_size_usd=float(os.getenv("MO_COPY_MIN_SIZE_USD", "500")),
+                    copy_fraction=float(os.getenv("MO_COPY_FRACTION", "0.25")),
+                    max_per_trade_usd=float(os.getenv("MO_COPY_MAX_USD", "100")),
+                )
+                tasks.append(_spawn("mitts_ofir_copy_trader",
+                                    lambda: _mo_trader.run()))
+                log.info(
+                    "mitts_ofir_copy_trader_loaded",
+                    lag_sec=_mo_trader.lag_sec,
+                    max_per_trade_usd=_mo_trader.max_per_trade_usd,
+                )
+
             # Arb auto-executor (pmwhybetter.md Problem-6 #1).
             # Polls monotonicity_arb + NegRisk sum-to-1 + in-play detectors
             # at 5-sec cadence and places multi-leg baskets via broker.submit().
