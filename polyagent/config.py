@@ -202,6 +202,21 @@ class Settings:
     enable_wash_filter: bool = os.getenv("ENABLE_WASH_FILTER", "1") == "1"
     wash_filter_max_share: float = float(os.getenv("WASH_FILTER_MAX_SHARE", "0.30"))
 
+    # Chronos-Bolt zero-shot price-series forecaster (idea #9 from
+    # PROJECT.md). Wired as an optional 4th combiner expert. **Default-off.**
+    # When ENABLE_CHRONOS=1, the live signaler computes a `p_chronos` per
+    # market and includes it in `expert_probs` keyed "chronos". The
+    # combiner only POOLS the chronos expert when the current
+    # combiner.joblib bundle's `expert_names` actually contains "chronos"
+    # — i.e. a retrain run grafted it in. So flipping the flag alone is
+    # safe (no pool-weight change); a follow-up retrain is required to
+    # actually weight the expert. Per the user's "Do not retrain the
+    # combiner — just wire the integration path" rule, this is the
+    # correct scope.
+    enable_chronos: bool = os.getenv("ENABLE_CHRONOS", "0") == "1"
+    chronos_horizon: int = int(os.getenv("CHRONOS_HORIZON", "24"))
+    chronos_min_history: int = int(os.getenv("CHRONOS_MIN_HISTORY", "32"))
+
     # Closed-loop combiner retraining
     enable_retrain_loop: bool = os.getenv("ENABLE_RETRAIN_LOOP", "1") == "1"
     retrain_experts: str = os.getenv("RETRAIN_EXPERTS", "stat_lgbm,news_match,p_market_6h")

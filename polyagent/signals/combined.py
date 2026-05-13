@@ -28,6 +28,7 @@ import structlog
 
 from polyagent.gamma import Market
 from polyagent.models.categorize import categorize
+from polyagent.models.chronos import ChronosForecaster
 from polyagent.models.lgbm import Predictor
 from polyagent.news_store import NewsStore
 from polyagent.orderbook import BookStore
@@ -54,6 +55,15 @@ class CombinedSignaler:
     min_edge: float = 0.10
     trader: Optional[TraderCallback] = None
     llm_forecaster: LLMForecaster | None = None
+    # Optional Chronos-Bolt forecaster. Off by default (ENABLE_CHRONOS=0).
+    # When set, the live loop computes `p_chronos` per market from the
+    # mid-history and includes it in `expert_probs`. It is only POOLED
+    # into the combined probability when the loaded combiner bundle's
+    # `expert_names` already contains "chronos" — wiring without retrain
+    # per the user's "wire the integration path" rule. When unpooled, the
+    # forecast still appears in the logged `detail.expert_probs` for
+    # offline analysis (correlation studies before a retrain).
+    chronos: ChronosForecaster | None = None
     # Karkare consistency check state (event_id -> {deviation, ts}). When
     # populated, large deviations downweight the llm_forecaster expert.
     consistency_state: dict | None = None
@@ -220,6 +230,38 @@ class CombinedSignaler:
                                     asyncio.get_running_loop().time(),
                                 )
 
+                # Optional Chronos forecast — runs when ENABLE_CHRONOS=1 and a
+                # forecaster object was passed in. Computed once per candidate
+                # whether or not "chronos" is in expert_names, so the detail
+                # row carries the forecast for offline correlation analysis
+                # ahead of any retrain. Cost is bounded by the min-history
+                # gate and the chronos module's own internal load/predict
+                # short-circuits when not installed.
+                p_chronos = None
+                if settings.enable_chronos and self.chronos is not None:
+                    try:
+                        book_yes = self.book_store.books.get(m.yes_token_id)
+                        hist = (
+                            [pt[1] for pt in book_yes._mid_history]
+                            if book_yes is not None
+                            and getattr(book_yes, "_mid_history", None)
+                            else []
+                        )
+                        if len(hist) >= settings.chronos_min_history:
+                            fc = self.chronos.predict(
+                                prices=hist[-max(64, settings.chronos_horizon * 2):],
+                                horizon=settings.chronos_horizon,
+                            )
+                            if fc:
+                                # Take the terminal forecast; clamp to a
+                                # legal probability range. Chronos is
+                                # forecasting the next mid (which is a price
+                                # in [0, 1] for binary tokens), so a direct
+                                # use as P(YES) is reasonable but coarse.
+                                p_chronos = max(0.01, min(0.99, float(fc[-1])))
+                    except Exception as e:
+                        log.warning("chronos_predict_error", err=str(e))
+
                 for name in expert_names:
                     if name == "stat_lgbm":
                         expert_probs[name] = pred["calibrated"]
@@ -229,6 +271,8 @@ class CombinedSignaler:
                         expert_probs[name] = news_p if news_p is not None else p_market
                     elif name == "llm_forecaster":
                         expert_probs[name] = p_llm if p_llm is not None else p_market
+                    elif name == "chronos":
+                        expert_probs[name] = p_chronos if p_chronos is not None else p_market
                     else:
                         expert_probs[name] = 0.5
 
@@ -358,6 +402,14 @@ class CombinedSignaler:
                     "category_used": used_cat,
                     "weights": dict(zip(expert_names, [round(w, 3) for w in weights])),
                     "expert_probs": {k: round(v, 4) for k, v in expert_probs.items()},
+                    # Surface p_chronos in the detail even when it isn't an
+                    # active expert in the loaded combiner — gives the
+                    # offline retrain pipeline a feature column to correlate.
+                    "p_chronos": (
+                        round(p_chronos, 4)
+                        if (settings.enable_chronos and p_chronos is not None)
+                        else None
+                    ),
                     "news_match_present": news_p is not None,
                     "question": m.question[:160],
                     "source": "combined",

@@ -415,6 +415,26 @@ class PaperBroker:
         # Reject trades on already-settled markets — they'd just sit at zero.
         if condition_id in self.settled_conditions:
             return 0.0
+        # Broker-level per-token BUY cap (PROJECT.md gate #3). Strategies are
+        # already supposed to call ``is_token_buy_capped`` before reaching here,
+        # but enforcing inside the broker makes the cap immune to a future
+        # strategy that forgets the check (e.g. news_trader currently does not
+        # call it). Arb strategies legitimately need multi-fill same-token
+        # activity for basket trades — yes_no_arb, arb_negrisk, arb_inplay,
+        # arb_monotonicity, *_unwind — and are excluded here per the same
+        # reasoning that exempts them from the cert gate (see arb_executor.py
+        # "Why this strategy bypasses the cert gate").
+        if side == "BUY":
+            s = (strategy or "").lower()
+            is_arb = s.startswith("arb_") or s.startswith("yes_no_arb") or s.endswith("_unwind")
+            if not is_arb and self.is_token_buy_capped(token_id):
+                log.info(
+                    "broker_buy_capped",
+                    strategy=strategy,
+                    token_id=token_id[:14],
+                    count=self.buys_in_window(token_id),
+                )
+                return 0.0
         book = self.book_store.books.get(token_id)
         if book is None:
             return 0.0

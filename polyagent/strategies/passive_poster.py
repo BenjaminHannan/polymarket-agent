@@ -71,6 +71,19 @@ class _PostedOrder:
 
 @dataclass
 class PassivePoster:
+    # Sizing calibration arithmetic (post-Session 3, kept conservative
+    # through the 2-week paper run targeted by the current goal):
+    #   broker.max_buys_per_token_window = 2 BUYs / 24h / token (hard cap)
+    #     => per-token-per-day notional ceiling = per_post_notional * 2 = $24
+    #     => system-wide saturated count = max_total_notional / per_post = 12.5
+    #     => binding cap is max_concurrent = 5, which keeps inventory diverse
+    # VWAP-fill simulation overstates real maker P&L by 20-40% per the HFT/MM
+    # literature (CLAUDE.md first-page warning). The current numbers absorb
+    # that gap; loosening them would re-open the Session 3 cycling vector,
+    # and tightening would suppress legitimate half-spread capture.
+    # TODO(post-2026-W3+): once scripts/reconcile_queue_aware.py confirms
+    # paper-vs-queue Sharpe degradation is in the expected 30-60% band, the
+    # per_post_notional ceiling can be raised to $15-18 with confidence.
     book_store: BookStore
     broker: PaperBroker
     markets_by_token: dict[str, Market]
