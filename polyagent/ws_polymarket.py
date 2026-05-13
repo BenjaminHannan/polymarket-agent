@@ -157,8 +157,16 @@ async def stream_market_chunk(
                             await _enqueue_or_drop(queue, evt)
                     elif isinstance(parsed, dict):
                         await _enqueue_or_drop(queue, parsed)
-        except (ConnectionClosed, WebSocketException, OSError, asyncio.TimeoutError) as e:
-            log.warning("ws_disconnect", err=str(e), backoff=backoff)
+        except (ConnectionClosed, WebSocketException, OSError, asyncio.TimeoutError,
+                AttributeError) as e:
+            # AttributeError catches a known websockets library bug where
+            # `self._transport` is set to None during SSL teardown but
+            # `maybe_resume()` still tries `resume_reading()` on it,
+            # producing "AttributeError: 'NoneType' object has no
+            # attribute 'resume_reading'". Treat as a transient
+            # disconnect and reconnect with backoff.
+            log.warning("ws_disconnect", err=str(e), err_type=type(e).__name__,
+                        backoff=backoff)
             if on_disconnect is not None:
                 try:
                     on_disconnect(asset_ids)

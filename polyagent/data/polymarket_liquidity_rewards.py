@@ -87,45 +87,60 @@ async def _http_get_json(url: str, *, timeout: float = 10.0) -> object | None:
 
 
 async def fetch_rewards_for_market(market_id: str) -> RewardsState | None:
-    """Pull rewards eligibility + pool data for one market.
+    """Pull rewards eligibility + parameters for one market.
 
-    The Gamma `/markets/{id}` endpoint returns a `rewards` block when
-    the market is enrolled in the Liquidity Rewards Program. The block
-    has the shape:
+    Verified against the live Gamma API (May 2026): rewards parameters
+    are exposed as **flat scalar fields** on the market object, not
+    nested in a `rewards` block. The relevant keys are:
 
+      - `rewardsMinSize`   — minimum quote size (shares) for eligibility
+      - `rewardsMaxSpread` — maximum half-spread (cents) for eligibility
+
+    A market is enrolled in the Liquidity Rewards Program iff either
+    field is non-zero. Gamma does NOT expose the per-market USDC pool
+    size on this endpoint — only the structural parameters. The pool
+    is shared across all eligible markets and distributed pro-rata to
+    each maker's quadratic-spread score. We populate `pool_size_usd`
+    with 0.0 here; the strategy uses `max_spread_bps` + `min_size_at_quote`
+    as the operational signal (quote tighter than max_spread_bps on
+    eligible markets to qualify for the daily share).
+
+    Reference: live response shape includes
       {
-        "rewards": {
-          "id": "<reward_id>",
-          "min_size": 50,
-          "max_spread": 300,         # bps; 300 = 3% half-spread cap
-          "rate_per_day": 5000,      # USDC/day
-          ...
-        }
+        "rewardsMinSize": 20,
+        "rewardsMaxSpread": 3.5,
+        ... (no nested 'rewards' block)
       }
-
-    Falls back to a CLOB-direct query if Gamma doesn't expose rewards.
     """
+    # Use the list form because /markets/{id} sometimes returns a
+    # wrapped object that varies in shape; the list form is reliable.
     try:
-        data = await _http_get_json(f"{GAMMA_API_BASE}/markets/{market_id}")
+        data = await _http_get_json(
+            f"{GAMMA_API_BASE}/markets?condition_ids={market_id}"
+        )
     except Exception as e:
         log.warning("rewards_fetch_failed", mid=market_id[:14], err=str(e))
         return None
-    if not isinstance(data, dict):
+    if isinstance(data, list):
+        if not data:
+            return None
+        market = data[0]
+    elif isinstance(data, dict):
+        market = data
+    else:
         return None
-    rewards = data.get("rewards") or {}
-    if not rewards:
-        # Not enrolled in the rewards program.
-        return RewardsState(
-            condition_id=market_id, is_eligible=False,
-            pool_size_usd=0.0, max_spread_bps=0.0,
-            min_size_at_quote=0.0,
-        )
+    rewards_min_size = float(market.get("rewardsMinSize") or 0.0)
+    rewards_max_spread_cents = float(market.get("rewardsMaxSpread") or 0.0)
+    is_eligible = rewards_min_size > 0 or rewards_max_spread_cents > 0
+    # rewardsMaxSpread is in *cents* (3.5 = 3.5¢ max half-spread).
+    # Convert to bps: 1 cent = 100 bps of probability space.
+    max_spread_bps = rewards_max_spread_cents * 100.0
     return RewardsState(
         condition_id=market_id,
-        is_eligible=True,
-        pool_size_usd=float(rewards.get("rate_per_day") or 0.0),
-        max_spread_bps=float(rewards.get("max_spread") or 300.0),
-        min_size_at_quote=float(rewards.get("min_size") or 0.0),
+        is_eligible=is_eligible,
+        pool_size_usd=0.0,   # not exposed on this endpoint; placeholder
+        max_spread_bps=max_spread_bps,
+        min_size_at_quote=rewards_min_size,
     )
 
 

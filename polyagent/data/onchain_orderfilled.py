@@ -464,5 +464,15 @@ async def run_onchain_ingester(
                 last_processed = to_block
                 _save_last_block(conn, state_key, last_processed)
         except Exception as e:
-            log.warning("onchain_ingester_error", err=str(e))
+            # Empty-string errors come from RPC responses where the
+            # exception's __str__ is empty (e.g., transient connection
+            # resets without a body). Include the type + repr so we
+            # can distinguish rate-limit / decode / timeout patterns
+            # in production logs.
+            log.warning(
+                "onchain_ingester_error",
+                err=str(e) or "(empty)",
+                err_type=type(e).__name__,
+                err_repr=repr(e)[:200],
+            )
         await asyncio.sleep(poll_sec)
