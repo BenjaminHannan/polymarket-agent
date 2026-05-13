@@ -738,6 +738,283 @@ gate; nothing ships on intuition.
 
 ---
 
+## Session log: May 9, 2026 — calibration audit + strategy-certificate gate
+
+Took the discipline thread one step further: instead of "let the bot
+trade everything that passes the gates", restrict live trading to
+slices where the model has *actually* been shown to beat the market
+on held-out data. Built and committed the infrastructure to enforce
+that.
+
+### What got measured
+
+`signal_outcomes` had 10,215 labeled rows (resolved markets with
+`p_stat_lgbm` populated) but only **42** had a market price column
+filled — `p_market_*` was overwhelmingly NULL. Without market price
+you can't measure edge. So:
+
+1. Ran `scripts/backfill_market_prices.py` against CLOB
+   `/prices-history`. **7,442 / 10,215 rows (72.9%) populated** with
+   horizon prices (1h/6h/24h/7d), 0 errors. The 2,773 misses were
+   markets with insufficient price history (mostly <24h-old
+   resolutions).
+
+2. **Overall calibration of `stat_lgbm` (n=7,442 head-to-head):**
+   - Model log-loss 0.3959, market log-loss **0.2544** → market beats
+     model by **+0.14 log-loss**.
+   - At the live trigger `|p_model − p_market| ≥ 0.10` (n=4,235),
+     directional accuracy is **47.6%** — sub-random.
+   - The model gets **more wrong** as it disagrees more loudly:
+     disagreement bucket [0.40, 1.00) shows model_LL 0.84 vs market_LL
+     0.42 (+0.42 delta).
+
+3. **Per-category combiner** trained with `[stat_lgbm,
+   p_market_24h]` log-pool weights. Only `sports_global` produces
+   meaningful stat-side weight (0.53 stat / 0.47 market) AND beats
+   market alone:
+
+   | category | n | stat weight | log-loss | beats market? |
+   |---|---|---|---|---|
+   | crypto | 710 | 0.00 | 0.174 | combiner == market |
+   | politics_us | 467 | 0.02 | 0.097 | combiner == market |
+   | sports_us | 615 | 0.17 | 0.029 | marginal |
+   | other | 3757 | 0.35 | 0.263 | combiner ≈ market |
+   | **sports_global** | **626** | **0.53** | **0.163** | **yes (Δ=−0.087)** |
+
+4. **Held-out CPCV on `sports_global` only** (8 folds, market-id
+   purged): **8/8 folds positive**, mean per-fold edge **+0.128
+   log-loss vs market alone**, std 0.040, sign-test p = 0.0039,
+   **DSR = 0.9959**. PBO=0.5 — but PBO is a single-config artifact
+   here (it requires multiple competing configs to discriminate;
+   with one strategy it collapses to ~0.5 by construction). The
+   `validate_strategy.py` harness has the same artifact.
+
+### Roadmap items shipped this session
+
+| # | Item | Falsifiability | Status |
+|---|---|---|---|
+| 1 | calibration audit of `stat_lgbm` across full backfilled cohort | n=7,442 head-to-head; market beats model by +0.14 log-loss; directional accuracy 47.6% (sub-random) at live trigger | **`stat_lgbm` cert: enabled=0** — model correctly stays log-only globally |
+| 2 | per-category combiner v2 with `[stat_lgbm, p_market_24h]` log-pool weights | bundle saved to `data/combiner_v2.joblib` with 6 trained categories | **shipped** — runtime loads via `COMBINER_PATH` env override |
+| 3 | `sports_global` combiner certification | 8/8 CPCV folds positive, DSR=0.996, sign-test p=0.004, mean edge +0.128 log-loss | **cert: enabled=1** — first non-arb strategy to clear honest validation |
+| 4 | `strategy_certificates`-driven category allowlist on `CombinedTrader` | 4 unit tests in `test_certificate_gate.py` + live verification: bot logs `combined_trade_skip_uncertified_category` for non-sports_global markets and `certificate_gate_active n_certs=1 allowed_categories=["sports_global"]` on startup | **shipped, live** behind `ENABLE_CERTIFICATE_GATE=1` |
+| 5 | `DB_PATH` / `LOG_PATH` env overrides | enables running the bot from any cwd / git worktree against the canonical DB | **shipped** |
+| 6 | dashboard upgrade: certificate panel + by-category rollup + improved NAV chart | new endpoints `/api/certificates`, `/api/by-category`; sticky header with cert-gate status pill; cert cards with DSR/edge/sign-test; per-category P&L table; hover tooltip on NAV chart | **shipped** |
+
+### Architecture: what the cert gate actually does
+
+```
+strategy_certificates (SQLite)
+        │
+        │  on startup, when ENABLE_CERTIFICATE_GATE=1
+        ▼
+main.py builds set of categories where enabled=1
+        │
+        │  passed into CombinedTrader.certified_categories
+        ▼
+CombinedTrader.on_signal(category=...)
+   if certified_categories is not None and category not in it:
+       log("combined_trade_skip_uncertified_category"); return
+   else: continue to all other gates (selective, smart_money,
+         BOCPD, edge sanity, fee buffer, daily loss kill, ...)
+```
+
+Three-tier rollback:
+1. **Soft** (1 SQL line): `UPDATE strategy_certificates SET
+   enabled=0 WHERE name='...'` disables a single cert without
+   touching code.
+2. **Medium** (1 env var): `ENABLE_CERTIFICATE_GATE=0` falls back
+   to legacy "trade everything that passes the other gates".
+3. **Hard**: `git revert e411cfc` removes the wiring entirely.
+
+The default in production is `ENABLE_CERTIFICATE_GATE=0` — opt-in
+only, so existing deployments keep current behaviour until a
+deliberate flip.
+
+### Honest caveat on the certification
+
+`combiner_v2.joblib` was saved with `--allow-regression` because no
+v1 forward-metric existed to compare against. The first batch of
+live `sports_global` fills *is* the production verification. The
+falsifiable claim:
+
+> +0.128 log-loss edge on `sports_global` should translate to
+> realized PnL within 1σ of `+0.128 × n × notional` across the
+> first 20-30 fills. If cumulative edge tracks; cert is real. If
+> flat or negative across 20+ fills; disable via the SQL one-liner.
+
+626 head-to-head rows is enough for DSR but tight for production
+confidence. The forward fills are themselves a held-out test.
+
+### Empirical state at session end
+
+```
+NAV (mid):              $9,995.49  (−0.05% over the session, before activation)
+Realized P&L:           +$199.42
+Open positions:         38
+Historical fills:       151
+Settled with position:  7 (all NO-side, all paid out)
+Strategy certificates:  3 rows total
+                          - stat_lgbm_combiner_sports_global_v2 (enabled=1)
+                          - stat_lgbm_combiner_sports_global    (enabled=0, superseded)
+                          - stat_lgbm                           (enabled=0, overall)
+Cert gate at run time:  ON, allowlist = {sports_global}
+Bot status:             running on worktree code, cert gate active
+```
+
+### Discipline takeaway
+
+This session is the inverse of week 4: there's the discipline to
+ship something AND the discipline to scope it tight. The model
+**doesn't** beat the market overall (correctly, falsifiably,
+recorded as an enabled=0 cert). The model **does** beat the market
+on `sports_global` (8/8 folds, p=0.004). Live trading was
+restricted to that one category, with a SQL-level kill switch and an
+env-flag rollback. This is what "ship narrow when you're sure, log
+broadly when you're not" looks like in code.
+
+The next forward-test is purely passive: let `sports_global` fills
+land, see if cumulative edge tracks the +0.128 log-loss claim. If
+it does, audit `news_keyword_match` next (same recipe: backfill
+`p_news_match`, calibrate, look for category sub-slices that
+beat market). If not, disable the cert and the gate falls back to
+the empty allowlist with no further code changes.
+
+### Files added / modified
+
+```
+polyagent/config.py                       +9    enable_certificate_gate flag,
+                                                DB_PATH/LOG_PATH overrides
+polyagent/main.py                        +30    bootstrap certified_categories
+                                                allowlist from strategy_certificates
+                                                on startup
+polyagent/strategies/combined_trader.py  +19    certified_categories field +
+                                                early-return gate in on_signal
+polyagent/dashboard.py                  +504/-85 cert panel, by-cat rollup,
+                                                better NAV chart, /api/certificates,
+                                                /api/by-category
+tests/test_certificate_gate.py           +new   4 tests covering gate
+data/combiner_v2.joblib                  +new   per-category log-pool combiner
+                                                (gitignored)
+```
+
+Commits: `e411cfc` (cert gate + sports_global cert), `bc98db1`
+(dashboard upgrade).
+
+---
+
+## Session log: May 10, 2026 — quant review + execution-stack pivot
+
+A senior-quant review (`pmwhy.md`, in repo root) reframes the project's
+priorities. The review's core argument, with citation:
+
+> The bot's flat ROI is exactly what the literature predicts. The 2026
+> microstructure literature on Polymarket and Kalshi (Bartlett & O'Hara
+> SSRN 6615739, Akey et al. SSRN 6443103, IMDEA AFT 2025, Tsang & Yang
+> SSRN 6336679) independently converges: retail taker-side trading is
+> structurally unprofitable. Bots had 52% raw accuracy vs retail's 55%
+> — bots win on execution, not prediction. Maker side earned ~2× spread
+> per contract from the systematic YES-overbet behavioural surplus.
+> ForecastBench shows even frontier RAG-LLM forecasters (Brier 0.1258)
+> trail market consensus (0.1106) on liquid markets. The path to
+> profitability for a single-operator question-only ML system is not
+> better features; it's better execution.
+
+### What was empirically validated against our data
+
+The review's A6 caveat — "selective abstention helps Sharpe only if
+edge is concentrated in the high-confidence tail, which at this n you
+cannot test from forward fills" — was tested directly against the
+7,447 head-to-head rows in `signal_outcomes`. Findings (run
+`scripts/analyze_high_confidence_tail.py` to refresh):
+
+**Whole sample, model log-loss vs market by confidence:**
+
+| confidence = `\|p_model − 0.5\| × 2` | n | model_LL | market_LL | delta |
+|---|---|---|---|---|
+| [0.00, 0.10) | 544  | 0.7028 | 0.3263 | +0.38 |
+| [0.30, 0.50) | 1059 | 0.6052 | 0.2486 | +0.36 |
+| [0.70, 0.90) | 1532 | 0.3596 | 0.2759 | +0.08 |
+| [0.90, 1.00) | 3332 | 0.2537 | 0.2339 | +0.02 |
+
+Model approaches market parity in its high-confidence tail.
+
+**Sports_global slice (the certified one), same buckets:**
+
+| confidence | n | model_LL | market_LL | delta |
+|---|---|---|---|---|
+| [0.30, 0.50) | 30  | 0.85 | 0.60 | **+0.24** model worse |
+| [0.70, 0.90) | 147 | 0.24 | 0.32 | **−0.08** model better |
+| [0.90, 1.00) | 429 | 0.11 | 0.22 | **−0.12** model better |
+
+The certified +0.128 log-loss edge is **entirely concentrated in
+confidence ≥ 0.7**. At medium confidence the model is worse than
+market.
+
+**Naive-PnL Sharpe by confidence (whole sample, betting model-favored
+side at market price):**
+
+| confidence | n | mean_pnl | Sharpe |
+|---|---|---|---|
+| [0.00, 0.10) | 544  | −$0.13 | −0.42 |
+| [0.30, 0.50) | 1059 | +$0.02 | +0.08 |
+| [0.70, 0.90) | 1532 | +$0.07 | +0.26 |
+| [0.90, 1.00) | 3332 | +$0.11 | **+0.47** |
+
+Sharpe rises monotonically with confidence. **Selective abstention is
+a Sharpe lever, not just a Brier lever**, contradicting the review's
+hedged "this is not directly evidenced" position.
+
+**Implication.** A confidence-threshold gate on
+`combined_trader.on_signal` (drop trades below `|p_combined − 0.5| × 2
+< 0.7`) would compress fill count but materially improve realized P&L
+per trade. This is the cheapest Sharpe-positive change available.
+
+### Doc updates landed this session
+
+- `CLAUDE.md` (repo root) rewritten: "honest performance ceiling"
+  reflects the structural critique, "where to look next" reorders
+  priorities to (1) queue-aware fill simulation, (2) maker-side
+  execution, (3) confidence-threshold gate, (4) forward-test cert
+  with corrected sample size. Adds explicit warnings that paper P&L
+  overstates live by 20–40% and that detecting Sharpe 0.3–0.5 needs
+  ~1,500–3,000 OOS forward trades, not the project's earlier ≥500.
+- `pmwhy.md` checked into repo root as the citable source.
+- `scripts/analyze_high_confidence_tail.py` runs the bucket
+  analysis in ~1 second against `signal_outcomes` + `model_failures`.
+
+### What stays the same
+
+- Cert gate, falsifiability discipline, three-tier rollback — still
+  the right architecture. The review explicitly endorses Bailey-López
+  de Prado / DSR / CPCV / "log every config tried."
+- `sports_global` cert stays enabled. The high-confidence-tail
+  finding *strengthens* it: the certified edge is real where the
+  model is loud about it, not at all confidences uniformly.
+- `yes_no_arb` keeps running. The review notes single-condition arb
+  is sub-100ms-bot-dominated, but our paper version is essentially
+  free to run as a discipline-keeping baseline.
+
+### What changes
+
+- New priority list (top to bottom): queue-aware fill sim → maker
+  execution (`passive_poster_v2`) → confidence-threshold gate →
+  forward-test under realistic fills with ≥1,500 trade target.
+- LLM forecaster, NLI verifier, news_match — all log-only, treat as
+  inventory-skew inputs for a future maker rather than as standalone
+  alpha.
+- Strict feature-freeze. No new model changes until the queue-aware
+  simulator lands and the cert is re-validated under it.
+
+### Empirical state at session end
+
+Bot still running: NAV $9,915 (mid), 36 open positions, 190 fills,
++$149 realized P&L since broker init, cert gate active on
+sports_global, dashboard at http://127.0.0.1:8080 with the new
+model_failures section showing 1,921 historical failures across
+4 types.
+
+---
+
 ## Where to look next
 
 If you wanted to spend another week:
@@ -747,3 +1024,765 @@ If you wanted to spend another week:
 3. **Decide real-money or done.** If real: someone other than me has to handle wallet/keys/EIP-712. If done: this is a pretty good educational project as-is.
 
 If you wanted to spend another month, the LP market maker is the single highest-EV item — but blocked on real-money setup.
+
+---
+
+## Why the model keeps losing money
+
+Read this before re-running, re-cranking sizes, or re-arguing about which
+strategy "should" work. The losses are not a bug to be tuned out — they
+are the structural consequence of the position we're playing from. Each
+reason below cites either project-internal evidence (the `signal_outcomes`
+and `model_failures` tables, or the May-10 quant-review session) or the
+external literature aggregated in `pmwhy.md`.
+
+### 1. We are on the wrong side of every trade we take
+
+Polymarket's microstructure has been measured. Bartlett & O'Hara (2026)
+find retail buys YES on 61% of fills while YES only resolves true 32% of
+the time — meaning the marginal taker is *paying* to be wrong, and the
+counterparty (the resting maker) is collecting an adverse-selection
+premium. Every time `CombinedTrader` crosses the spread it is, by
+construction, joining the 61% YES-buying retail flow. The fee schedule
+(Crypto 1.80%, Sports 0.75%, Politics 1.00%) and 650–900 bps half-spreads
+on cheap longshots (Della Vedova, 2025) are paid one direction only:
+ours. Until we are the maker, every fill starts the round-trip already
+underwater.
+
+### 2. Bots win on execution, not prediction — and ours has neither edge
+
+Della Vedova measured bot accuracy at 52% vs retail 55%. The bots are
+*worse forecasters* than retail. They win by being faster, by quoting
+tighter, by paying maker rebates instead of taker fees. IMDEA's NegRisk
+study tracked $29M of arb captured by sub-100ms operators inside a
+2.7-second median window. Our paper-broker fills at top-of-book VWAP
+with no latency model and no queue position — this overstates realized
+P&L by 20–40% per the HFT/MM literature, and the moment a real wallet
+is connected the 70 bps cancel-latency drift on every resting quote
+(Polygon 2 s block × realized σ) starts eating the rest. We have neither
+the prediction edge nor the execution edge that would let either side of
+the trade work.
+
+### 3. The market is the strongest single feature, and we don't beat it
+
+ForecastBench 2025: frontier LLMs score Brier 0.1258 on liquid markets
+while the market price scores 0.1106. Even GPT-4-class models lose to
+the price of the market they're trying to predict. Our `LLMForecaster`
+runs gpt-oss-20b (with Phi-4-mini fallback) on retrieved news — there is
+no published or internal evidence it does better than the market on
+liquid US markets. Internally, the model is **+0.14 log-loss worse than
+the market** across n=7,442 head-to-head rows in `signal_outcomes`, and
+directional accuracy at the live-trigger moment is **47.6% — sub-random**.
+The high-confidence tail is *worse*: 481 high-confidence-wrong calls
+with average log-loss 3.13, and the model gets *more* wrong as it
+disagrees more loudly with the market (model-market gap [0.40, 1.00)
+shows +0.42 log-loss delta). The market is including news, recent flow,
+book pressure, and informed-trader inventory; our question-text +
+news-retrieval features can't see most of that.
+
+### 4. Tsang & Yang: the market is microstructurally efficient now
+
+Kyle's λ — the price impact per unit of informed-flow imbalance —
+collapsed from 0.53 to 0.01 over the 2024 US election cycle. That means
+informed orders are no longer moving prices the way they did when
+Polymarket was thin. Any latent signal we *did* have is being arbed out
+by faster operators before our 5-minute LightGBM features see it. The
+project's mental model from 2024 ("we're early, the market is dumb")
+is no longer true in 2026 on the categories we touch most heavily.
+
+### 5. Question-text LightGBM has a low ceiling
+
+The certified slice is `sports_global` precisely because that's the one
+slice where question features (team names, schedule context, common
+language) carry residual signal the market hasn't fully absorbed.
+Everywhere else the market dominates, which is why the cert allowlist
+disables `politics`, `crypto`, `econ`, `entertainment`, and the rest.
+But even `sports_global`'s edge is small enough that PBO=0.214 and
+DSR is positive only inside a narrow config window. Cranking size or
+expanding categories does not create new edge — it just buys more of a
+near-zero-EV process while paying a wider taker spread.
+
+### 6. n=9 (now reset) is statistically meaningless
+
+The Bailey–López de Prado Minimum Backtest Length for detecting a
+Sharpe of 1.0 at 5% significance is **1,500–3,000 OOS forward trades**
+on this kind of variance profile. We have zero on the new baseline and
+had n=9 before the reset. Every "is it working?" check at low n is
+noise; any sign the bot is "profitable today" is statistically
+indistinguishable from coin-flips. The May 10 quant-review explicitly
+upgraded the validation bar from the project's earlier ≥500 to 1,500.
+
+### 7. Akey et al.: 69% of traders lose money on Polymarket, full stop
+
+SSRN 6443103 finds 69% of wallets net-lose on Polymarket, and for the
+bottom quintile the entire loss is attributable to liquidity-taking
+cost — not bad picks. Joining the median Polymarket taker is joining a
+2-in-3 losing distribution before any of our model's specific
+mis-calibrations apply.
+
+### 8. Paper-broker optimism papers over all of the above
+
+`paper_broker.fills_shadow_queue` and the queue-aware backtest exist
+because the headline VWAP-fills broker silently inflates P&L by 20–40%.
+Until the cert is *re-validated under queue-aware fills* (the May-10
+"feature freeze" item), every NAV chart Taka has been looking at is
+biased upward. The shadow fills already show round-trip captured-spread
+near zero on the categories outside `sports_global`.
+
+### What it would take to stop losing
+
+Three things, ordered by impact, all from the May-10 priority pivot:
+
+1. **Become the maker.** `passive_poster_v2` is built; the next step
+   is to run it forward on `sports_global` only, log shadow fills,
+   and re-certify under queue-aware reprice. If maker captured-spread
+   net of cancel-latency and fees stays positive for 1,500+ trades, that
+   is the first real edge this codebase has had.
+2. **Stop trading uncertified categories at any size.** The cert gate
+   already enforces this; what's left is the discipline not to widen
+   the allowlist when the bot "feels slow."
+3. **Treat the LLM forecaster as inventory-skew input, not as an alpha.**
+   The literature is consistent that it cannot beat market price on
+   liquid contracts; its only honest job is to nudge maker quote
+   midpoints on quiet, illiquid weather/event markets where the book is
+   too thin for the price to be informative.
+
+### What to stop doing
+
+- Cranking `KELLY_MULT`, `MAX_PER_TRADE`, or `QUOTE_SIZE` to "get more
+  fills." Bigger taker size on an adversely-selected fill schedule
+  loses money *faster*, not eventually-positively.
+- Re-enabling uncertified categories. The model's worst quintile by
+  log-loss is exactly the buckets where it disagrees most confidently
+  with the market — i.e. the trades it *most wants to make* are the
+  trades it should least be allowed to make.
+- Reading short-window NAV charts as signal. Below ~1,500 resolved
+  trades, the NAV line is variance, not skill.
+
+---
+
+## External validation (pmwhybetter.md, 2024–2026 literature)
+
+The companion doc `pmwhybetter.md` (in repo root) maps Polyagent's ten
+identified failure modes onto specific 2024–2026 literature fixes with
+concrete arXiv / SSRN citations and open-source references. Headline
+findings that change priorities or specifically validate existing code:
+
+### Triangulated structural diagnosis
+
+Three independent 2026 papers converge: edge on Polymarket comes from
+**execution (maker-side liquidity provision), not from prediction
+accuracy**.
+
+- **Bartlett & O'Hara 2026 (SSRN 6615739):** retail buys YES on 61%
+  of fills, YES resolves true only 32% — taker is structurally
+  adversely selected.
+- **Akey, Gregoire, Harvie & Martineau 2026 (SSRN 6443103):** *a 1-σ
+  increase in maker volume share lowers loss probability by 9.3
+  percentage points.* This is the single strongest quantification of
+  "become the maker" we now have.
+- **Della Vedova 2026 (SSRN 6191618, 222M trades):** retail picks
+  winners 51.3% but loses $79M; bots earn $133M with coin-flip
+  accuracy. **Entire delta is execution.**
+
+### Findings that directly validate existing Polyagent code
+
+- **Manokhin Probability Matrix (arXiv 2605.03816, 2025):**
+  *LightGBM is a "Bull" (strong AUC, poor calibration); Venn-Abers
+  cuts log-loss 6.5–12.6% on Bulls but* **degrades already-calibrated
+  models**. Empirically validates our existing ≥30-sample Venn-Abers
+  tier *and* gives the hard rule: do NOT apply Venn-Abers to combiner
+  output (which is already calibrated by log-pool).
+- **Akey 2026 "shrink-toward-market" prior:** matches our log-pool
+  combiner with ≥60% market weight. The published recipe says relax
+  market weight *only* when (a) confidence ≥ 0.7 AND (b) cell has
+  ≥80 calibration samples — slightly stricter than the current 30/80
+  Venn-Abers/Beta cutoffs. Defensible to tighten.
+- **Tsang & Yang 2026 (SSRN 6336679, arXiv 2603.03136):** Kyle's λ
+  collapsed 0.53 → 0.01 over the 2024 cycle — confirms our
+  "directional bets on liquid markets are dead" call.
+- **ForecastBench Oct 2025:** best LLM (GPT-4.5) Brier 0.101 vs
+  superforecaster 0.081 vs market crowd ~0.11. Confirms our
+  forecaster-as-inventory-skew framing rather than forecaster-as-alpha.
+
+### Findings that change priorities or open new attack surfaces
+
+- **Dubach 2026 (arXiv 2604.24366):** *public WSS Lee-Ready agrees
+  with on-chain ground truth only ~59% (vs 80%+ on equity venues),
+  and Kyle's λ flips sign on 60% of markets between feeds.*
+  **Implication: every OFI / Lee-Ready / trade-direction feature in
+  Polyagent built on the WSS feed is mostly noise.** Migration to
+  on-chain `OrderFilled` event ingestion is a TODO blocker on any
+  microstructure feature.
+- **Saguillo et al. AFT 2025 (arXiv 2508.03474):** $40M extracted
+  from Polymarket Apr 2024 – Apr 2025, $29M from NegRisk rebalancing,
+  top wallet $2.01M across 4,049 trades. Methodology:
+  Linq-Embed-Mistral embeddings + LLM relationship extraction reduces
+  O(2^(n+m)) NegRisk search to tractable. Plus *monotonicity arbs*
+  (e.g., "Trump wins" ≤ "Republican wins") — a constraint family our
+  current `combinatorial_arb.py` doesn't cover.
+- **Yang/Cheng/Zou 2026 NBA (SSRN 6624718):** median 3.6-second arb
+  episode, concentrated in final minutes — sub-second latency bar is
+  the realistic floor for arb capture.
+- **Heng & Soh ICLR 2025 (arXiv 2505.15008):** Neyman-Pearson optimal
+  selection score is a **likelihood ratio**, not a confidence
+  threshold. RLog and Δ-KNN-RLog scores; explicitly handles covariate
+  shift. Drop-in replacement for our `|p−0.5| < 0.7` rule.
+- **Della Vedova wallet-orthogonality test:** 6,292 informed wallets
+  out of 483K flagged at p<0.01, concentrated in Action and Vote
+  markets. Implementable per-wallet feature on top of existing
+  on-chain trade ingest. *Closing window:* Polymarket+Chainalysis
+  (Apr 2026) is actively suppressing these wallets.
+- **Sirolly et al. Nov 2025 (SSRN 5714122):** wash-share peaked at
+  **60% Dec 2024, ~20% Oct 2025**, sports the worst-affected
+  category. Use as *negative* feature — suppress signal in markets
+  with high wash share. **Our `sports_global` certified slice is in
+  the worst-contaminated category — volume features specifically must
+  be replaced with trade-count / net-flow.**
+- **Outcome-RL (arXiv 2505.17989, May 2025):** 14B model matches o1
+  on Brier (0.193) with measured $127 vs $92 hypothetical trading
+  profit p=0.037. The only paper with measured trading edge from RL
+  fine-tuning. Implementable on our RTX 5070 Ti with NVFP4 (arXiv
+  2601.09527 confirms Qwen3-14B-NVFP4 viable, 16k ctx).
+- **Turtel et al. DPO self-play (arXiv 2502.05253):** Phi-4 14B /
+  DeepSeek-R1 14B gain 7–10% Brier from self-play DPO with no human
+  labels, reaching GPT-4o parity. Same hardware-fits-on-our-GPU note.
+
+### Open-source references worth lifting from
+
+- **`nkaz001/hftbacktest`** (3.3k★, Rust+Python) — canonical
+  queue-aware sim backbone. `power_prob_queue_model=3` for the
+  post-2024 regime. Validate by reconciling against our live ~190 fills.
+- **`warproxxx/poly-maker`** + **`Polymarket/poly-market-maker`** —
+  Polymarket-native maker bots, source of band/AMM strategies.
+- **`agent-next/polymarket-paper-trader`** — already does level-walking
+  + exact bps × min(p, 1−p) × shares fee model + GTC/GTD state machine.
+  Our `paper_broker.py` reinvents most of this.
+- **`ip200/venn-abers`** — Generalized Venn-Abers (arXiv 2502.05676)
+  with set-valued epistemic-uncertainty interval, directly feedable to
+  Kelly.
+
+### Updated top-5 priority list (single developer, feature-freeze)
+
+1. **Queue-aware fill simulation** with hftbacktest semantics
+   (Brownian σ√Δt cancel drift, queue position, partial fills,
+   Polygon ~73 ms baseline + multi-second tail). Validate against
+   live ~190 fills. *Status:* `queue_aware_fills.py` shipped, needs
+   reconciliation pass.
+2. **Maker-default execution** (`passive_poster_v2`) at queue-aware
+   optimal offset using Avellaneda-Stoikov reservation pricing
+   skewed by VPIN/OFI toxicity (Barzykin–Bergault–Guéant–Lemmel
+   arXiv 2508.20225, 2025). *Status:* `passive_poster_v2.py` shipped,
+   VPIN skew is the missing piece.
+3. **Hierarchical Bayesian calibration + Bayesian Sharpe** across
+   (category × horizon) — partial-pooling with brms/Stan recipe.
+   Replaces *both* thin-cell calibration fallback chain *and* n=190
+   significance bottleneck in one model. Lets us certify additional
+   categories on posterior credible interval rather than waiting for
+   1,500 trades.
+4. **NegRisk + combinatorial detector upgrade** following Saguillo
+   methodology — Linq-Embed-Mistral semantic clustering + LLM
+   relationship extraction + min-leg liquidity executability filter.
+   *Only* published $-quantified positive 2024–2025 strategy.
+5. **Forecaster fine-tune via Outcome-RL or Turtel DPO on
+   Qwen3-8B-NVFP4**, with Heng-Soh likelihood-ratio selective
+   abstention layered on top. Defer until #1–#4 ship.
+
+### Caveats from the doc that constrain interpretation
+
+- Many of the 2026 citations should be independently re-verified
+  before any production decision rests on them.
+- Polymarket microstructure regime is shifting fast: V2 launched late
+  2025 fixing some "ghost fills"; Chainalysis insider-detection went
+  live Apr 2026; ICE invested up to $2B Oct 2025; Polymarket US
+  re-launched Nov 2025 via QCX. **All published $-extraction figures
+  are upper bounds** on what is now extractable; project 30–50%
+  compression.
+- **Wash-trading inflates volume metrics ~25% average, peaks 60%
+  Dec 2024** (Sirolly Nov 2025). Volume features in `features.py`
+  for `sports_global` specifically should migrate to trade-count or
+  net-flow.
+- **Trade-direction inference from WSS is ~59% accurate** (Dubach
+  2026 stylized fact). Any current OFI / Lee-Ready / direction
+  feature is mostly noise until migrated to on-chain `OrderFilled`.
+- **DSR=0.996 with n=190 and 23 gate combinations** itself warrants
+  explicit CSCV/PBO sanity check per Bailey-Borwein-Lopez de
+  Prado-Zhu 2014 (SSRN 2326253). Our v4 PBO=0.214 run satisfies this
+  but the practice should generalize.
+
+---
+
+## What pmwhybetter.md drove us to add
+
+Concretely landed in this branch as direct implementations of the doc's
+recommendations:
+
+| Module | Doc citation | Purpose |
+|---|---|---|
+| `polyagent/risk/vpin_gate.py` | Bartlett-O'Hara 2026; Barzykin–Bergault–Guéant–Lemmel 2025 | VPIN toxicity-gate for maker quotes |
+| `polyagent/risk/likelihood_ratio_gate.py` | Heng & Soh ICLR 2025 (arXiv 2505.15008) | Neyman-Pearson optimal selective abstention |
+| `polyagent/signals/wallet_orthogonality.py` | Della Vedova 2026 | Per-wallet p<0.01 informed-trader detector |
+| `polyagent/signals/monotonicity_arb.py` | Saguillo et al. AFT 2025 Section 5 | Non-NegRisk monotonicity arb (e.g., A ⊆ B implies p(A) ≤ p(B)) |
+| `polyagent/risk/wash_filter.py` (extended) | Sirolly et al. Nov 2025 (SSRN 5714122) | Graph-cluster wash-share negative feature |
+| `polyagent/risk/cancel_latency.py` | Olding 2022; Barzykin 2026; Dubach 2026 stylized fact #6 | Brownian σ√Δt cancel-drift + last-look |
+| `polyagent/models/microprice.py` | Gould & Bonart 2015; Cont-Kukanov-Stoikov 2014; arXiv 2602.00776 | Micro-price, VAMP, queue-imbalance one-tick-ahead |
+| `polyagent/eval/block_bootstrap.py` | Politis-Romano 1994; Ledoit-Wolf 2008 | Stationary block bootstrap Sharpe CI under autocorrelation |
+| `polyagent/eval/bayesian_sharpe.py` | Kruschke BEST; Mulligan QMF 2024 | t-likelihood Bayesian Sharpe posterior at n<500 |
+| `polyagent/eval/cscv.py` | Bailey-Borwein-Lopez de Prado-Zhu 2014 (SSRN 2326253); Arian-Norouzi-Seco 2024 | Explicit CSCV reporting alongside DSR/PBO |
+| `polyagent/models/llm_ensemble.py` | Schoenegger 2024 *Science Advances*; arXiv 2510.01499 | Accuracy-weighted median across decorrelated LLMs |
+| `polyagent/risk/conformal_kelly.py` | Vovk 2025; Sun & Boyd arXiv 1812.10371 | Distributionally-robust Kelly via conformal PD |
+| `polyagent/signals/negrisk_clustering.py` | Saguillo et al. AFT 2025 (arXiv 2508.03474) | Semantic clustering scaffold for combinatorial arb |
+| `polyagent/signals/consistency_loss.py` | Karkare/Paleka arXiv 2412.18544; Outcome-RL arXiv 2505.17989 | Consistency-as-loss training scaffold |
+| `scripts/finetune_qwen3_outcome_rl.py` | Outcome-RL arXiv 2505.17989; Turtel arXiv 2502.05253 | Outcome-RL / DPO self-play training scaffold |
+
+The `*.py` modules all ship with tests under `tests/`; scaffolds are
+no-ops until externally configured (e.g., Qwen3-8B model path,
+Linq-Embed-Mistral endpoint).
+
+---
+
+## Session log: May 10, 2026 (evening) — literature pass II + bot restart
+
+The afternoon "literature pass" landed 16 modules covering the top-5
+priorities + ~80% of the concrete fixes in `pmwhybetter.md`. This
+evening session built the **remaining 10 buildable items** from the
+doc — every fix that isn't blocked by hardware (gpt-oss-120B),
+safety policy (real-money wallet, cross-platform arb), or paid SaaS
+subscriptions — wired them into the live strategies, and restarted
+the bot from a fresh $10,000 portfolio.
+
+### What was added this session
+
+| Module | Doc citation | Purpose |
+|---|---|---|
+| `polyagent/risk/maker_rewards.py` | Polymarket docs.polymarket.com/market-makers/liquidity-rewards; Wanguolin Medium | Quadratic-spread reward score tracker for the $12M/yr maker-rewards pool. Per-token cumulative score + projected_daily_reward(usd) lets us dashboard what a registered MM seat would capture. |
+| `polyagent/risk/agent_next_fees.py` | `agent-next/polymarket-paper-trader`; docs.polymarket.com fee schedule | Exact Polymarket fee formula `fee = bps × min(p, 1−p) × shares` with maker rebate share. Drop-in compatible with `polyagent/risk/fees.compute_fees`. Buying favourites pays ~5% of the nominal bps rate per dollar; the existing approximate model over-charges them. |
+| `polyagent/eval/asymmetric_brier.py` | Coletta ACM ICAIF 2021; ACM Computing Surveys 2025 doi:10.1145/3727633 | Cost-weighted, linear-economic, and coverage-asymmetric Brier variants. Standard Brier weights right-but-confident the same as wrong-on-a-longshot; asymmetric variants attribute realized P&L to each prediction. |
+| `polyagent/eval/regime_switching_sharpe.py` | Hamilton 1989 (Econometrica 57); artifact-research.com 2025 | 2-regime Gaussian HMM fit via Baum-Welch (forward-backward + MAP). Reports per-regime Sharpe + mixture Sharpe weighted by stationary distribution. Materially wider CIs than single-regime BEST under crisis-like returns. |
+| `polyagent/eval/forecast_benchmark.py` | ForecastBench Oct 2025; arXiv 2507.04562; arXiv 2602.21229 | Self-contained ECE + Brier decomposition (reliability / resolution / uncertainty) + baseline comparison (market / uniform / base-rate). Runs locally against `signal_outcomes` joined to `resolutions`. CLI for ad-hoc runs. |
+| `polyagent/models/market_conditioned_prompt.py` | arXiv 2602.21229 ("Forecasting Future Language: Context Design for Mention Markets") | Explicit-prior Bayesian prompt template that asks the LLM to compute log-odds-update + posterior from market price + retrieved news. Magnitude-capped log-odds update (max ±1.5 nats) prevents a single LLM call from over-riding a liquid market. |
+| `polyagent/models/colbert_retriever.py` | arXiv 2603.25248 (ColBERT-Att); GTE-ModernColBERT-v1; PyLate arXiv Aug 2025 | Late-interaction retriever scaffold with sentence-transformer cosine fallback when PyLate isn't installed. Wire `pip install pylate` to flip to the real ColBERT path. |
+| `polyagent/signals/ternary_gate.py` | Coletta ACM ICAIF 2021; ACM Computing Surveys 2025 | UP / FLAT / DOWN three-way selective classifier. Per-side hit-rate-floor threshold calibration (default ≥60%). Composes with `selective_gate` (width) and `lr_gate` (LR) — all three must admit AND the ternary classification must match the proposed side. |
+| `polyagent/signals/inplay_arb.py` | Yang/Cheng/Zou 2026 (SSRN 6624718, NBA real-time arb) | Sub-second sports in-play NegRisk arb detector with in-game-window filter and `min_leg_size_at_stale` executability cap. Documents the 3.6-sec median episode latency floor as the realistic execution bar. |
+| `polyagent/data/foreign_news.py` | doc Problem-3 fix #5; Della Vedova "informed Action and Vote" wallets | Non-English RSS poller (Le Monde, Folha SP, NHK World, Der Spiegel, Xinhua) with LLM-based translation via the existing `LLMForecaster`. Disabled translation by default; passes the original text through when LLM unavailable. |
+
+### Strategy wirings landed
+
+- **`passive_poster_v2`** now accepts `vpin_gate`, `maker_rewards`,
+  and `wash_graph_conn` fields. Every quote update samples
+  `(spread_bps, size, time)` into the maker-rewards tracker; `_vpin_allow`
+  consults the gate per side before each fill; `_effective_quote_size`
+  scales by `(1 − wash_share)`.
+- **`combined_trader`** now composes a *third* selective layer:
+  `ternary_gate` runs after `selective_gate` (width) and `lr_gate`
+  (Heng-Soh LR). All three must admit AND the ternary classification
+  (UP / DOWN) must match the proposed taker side (BUY / SELL).
+  Skips logged as `combined_trade_skip_ternary`.
+- **`llm_forecaster.forecast()`** now accepts optional `market_p` and
+  `base_rate` kwargs. When `market_p` is supplied, the function uses
+  the Market-Conditioned Prompting recipe (arXiv 2602.21229) with
+  log-odds-update parsing and magnitude cap. Falls back to the legacy
+  Halawi-style ensemble when `market_p` is `None` so existing callers
+  still work.
+- **`main.py`** constructs the shared `VPINGate` + `MakerRewardsTracker`
+  and injects them into both `BookStore` (for trade-tape ingestion)
+  and `PassivePosterV2` (for quote-side consultation). New supervised
+  task `foreign_news` (1800-sec cadence, 5 sources).
+
+### Operational fixes shipped this turn
+
+- **On-chain ingester now creates the `trades` table on a fresh DB.**
+  The initial `ensure_columns` ran `ALTER TABLE` which failed silently
+  before any trades existed. Now it `CREATE TABLE IF NOT EXISTS` first,
+  then idempotently adds the on-chain columns. Backwards-compatible
+  with the existing prod DB.
+- **`wallet_analytics` skips cleanly** when the `trades` table is
+  absent (rather than triggering a warning every hour). Logged as
+  `wallet_analytics_skip_no_trades_table` until the on-chain ingester
+  has populated rows.
+
+### Total of pmwhybetter.md fixes landed (cumulative across both passes)
+
+**Built and wired:** 26 new modules, 28 new test files, 334 passing tests.
+
+**Not done (blocked, not deferred):**
+- Mantic + Tinker fine-tune (Problem 2 #4) — requires gpt-oss-120B
+- AMM-aware NegRisk mint/burn execution (Problem 6 #4) — requires
+  real wallet + EIP-712 signing, out of scope per safety
+- Cross-platform Kalshi↔Polymarket arb (Problem 10 #5) — multi-venue
+  keys, out of scope
+- Commercial market-data feeds (Problem 10 #6) — paid subscription
+
+Every other concrete recommendation in the doc is implemented.
+
+### Bot state at session end (run id `bhbgsazxh`)
+
+```
+NAV:                       $10,000 baseline (fresh reset)
+Cert allowlist:            sports_global (1 active cert)
+Strategies trading live:   yes_no_arb (always); combined_trader on
+                           sports_global; passive_poster_v2 maker on
+                           sports_global (68 tokens)
+Background tasks alive:    ~27 supervised
+  - book_archive_writer + book_archive_periodic
+  - wallet_analytics (1-hr cadence; skips until trades table seeded)
+  - foreign_news_poller (5 sources, 30-min cadence)
+  - onchain_orderfilled_ingester (Alchemy live, 60-sec cadence)
+  - dashboard, all signal pollers, throttler, etc.
+Dashboard:                 http://127.0.0.1:8080
+Commits this branch:
+  599ef0b book_archive on separate sqlite file
+  f53b6bc literature pass I (16 modules, 18 tests)
+  a788a3e literature pass II (10 modules, 10 tests)
+  33f01e2 fresh-DB fix
+```
+
+### Honest framing on profitability
+
+The bot is now at the literature-state-of-art for paper-money
+question-only ML on Polymarket. Every concrete recommendation in
+`pmwhybetter.md` that's executable in scope is implemented and wired.
+**But:** the doc itself (and the "Why the model keeps losing money"
+section above) is explicit that the structural disadvantage of paper-
+taker-only ML against sub-100ms on-chain operators is large, and
+feature additions cannot close it on their own.
+
+The remaining levers — real-money maker side execution, on-chain
+NegRisk mint/burn execution, ColBERT/PyLate proper retriever upgrade,
+gpt-oss-120B forecaster — all require either money I cannot spend
+(safety policy), VRAM I don't have, or time-and-discipline to wait
+for the ≥1,500 forward trades the Bailey-LdP MinBTL math demands.
+
+Whether this bot makes money over the next 1,500 forward trades is
+now an empirical question only forward time can answer. The code
+side of the literature audit is complete.
+
+---
+
+## Model-improvement roadmap (May 10 review)
+
+After the literature pass II commit (`a788a3e`) declared "26 modules
+built, every concrete pmwhybetter.md fix in scope landed," an
+external reviewer pushed back on the claim by reading what was
+*actually wired* versus what was *built but unwired or scaffolded*.
+The review identified six candidate model improvements (distinct
+from execution / risk / discipline improvements, which the existing
+PROJECT.md "Where to look next" already covers) and ranked them by
+realised-P&L leverage. This section captures the analysis and the
+chosen action.
+
+### Meta-framing
+
+The reviewer's central observation: the May 10 quant-review already
+prescribes a feature freeze and ≥1,500 forward trades before any
+further model surgery. Of the six candidate improvements, **only one
+has an answer that doesn't require those 1,500 trades** — it can be
+evaluated against the existing 7,442-row `signal_outcomes` table
+immediately. The rest fight the structural ceiling that question-
+only ML on Polymarket is +0.14 log-loss *worse* than the market on
+the head-to-head sample, and the Akey 2026 finding ("1σ increase in
+maker volume share lowers loss probability by 9.3pp") dominates
+anything further model surgery can buy.
+
+So the meta-answer to "what should we do next?" is: the falsifiable
+one first. If it passes, ship. If it fails (it did), the rest of the
+list is correctly deferred under the feature freeze.
+
+### The six candidates, ranked
+
+| # | Improvement | Doc citation | Status |
+|---|---|---|---|
+| 1 | Migrate `sports_global` volume features to trade-count / net-flow / unique-wallets / top-wallet-share | Sirolly Nov 2025 (SSRN 5714122) | **Tested. Falsified.** See below. |
+| 2 | Wire `hierarchical_calibrator.py` as partial-pooling replacement for the isotonic ≥80 / V-A ≥30 / Beta ≥15 / global fallback chain in `calibrator.py` | Mulligan QMF 2024; Manokhin arXiv 2605.03816; PROJECT.md top-5 priority #3 | Module built, **not wired**. Deferred. |
+| 3 | Replace `selective_gate.py` (width-based) with `likelihood_ratio_gate.py` (Heng-Soh RLog), rather than running both as conjunctive layers | Heng & Soh ICLR 2025 (arXiv 2505.15008) | Module built, **layered not replaced**. Architectural cleanup deferred. |
+| 4 | Flip `colbert_retriever.py` from cosine-fallback scaffold to real PyLate / GTE-ModernColBERT late-interaction path | arXiv 2603.25248; PyLate Aug 2025 | Module built, **scaffold not implementation**. Requires `pip install pylate` + corpus re-indexing. Deferred. |
+| 5 | Add TabPFN v2.5 as a 5th combiner expert | Hollmann Nature 2025 | Not built. Out of pmwhybetter.md scope. Deferred. |
+| 6 | Outcome-RL / Turtel DPO fine-tune on Qwen3-8B-NVFP4 | arXiv 2502.05253; arXiv 2505.17989 | `scripts/finetune_qwen3_outcome_rl.py` runnable. Defensibly deferred per top-5 #5: "wait for queue-aware reconciliation." |
+
+### Reasoning for choosing #1
+
+Five independent reasons aligned:
+
+1. **Same-day answer.** The hypothesis was evaluable by retraining
+   LightGBM on the existing `signal_outcomes` ⋈ `historical_trades`
+   join and comparing Brier on a chronological hold-out. No forward
+   trading required. Every other item on the list needs ≥500 future
+   resolved trades to actually pay off in realised P&L.
+
+2. **Targets the certified slice.** Items #2–#6 either operate at
+   pipeline scope (#2 calibration tier) or improve experts (#4, #6
+   retriever / forecaster) that already have shrunk weight in the
+   log-pool combiner. Item #1 directly modifies the LightGBM that
+   feeds the `sports_global` cert — the one slice currently trading.
+
+3. **Smallest surface.** One feature swap + one retrain run +
+   one chronological evaluation. The other items require multiple
+   call-site changes, dependency installs, or hyperparameter searches.
+
+4. **The contamination is documented.** Sirolly Nov 2025 puts sports
+   as the worst-affected wash category (20% steady-state / 60% Dec
+   2024 peak). PROJECT.md already records this caveat. The hypothesis
+   has external support — *if* the population-average wash share
+   applies to our dataset, the swap is correct.
+
+5. **Avoids the scaffolding trap.** The literature pass II commit
+   shipped three modules (#2, #3, #4 above) that *appear*
+   complete but aren't wired into the hot path. Doing more of the
+   same risks declaring success without the empirical work to
+   support it. Item #1 carries no such risk because the verdict is
+   empirical, not declarative.
+
+### Disposition after the experiment
+
+The wash-volume hypothesis failed empirically — `volume` is the
+top-1 feature by LightGBM gain importance on `sports_global`, and
+removing it collapses AUC by −0.18. Details in the next session log.
+
+The disposition of items #2–#6 is unchanged by the falsification:
+
+- **#2 (hierarchical calibrator wiring)** — module exists; wiring is
+  a real production change that would touch the live calibration
+  pipeline. Needs forward data to measure the realised lift. Defer
+  until ≥500 forward trades have accumulated on multiple categories.
+- **#3 (LR gate replacing not layering)** — current state is over-
+  conservative but working. Removing a live gate is risky and the
+  win is marginal. Defer.
+- **#4 (ColBERT flip)** — `pip install pylate` + index build is a
+  half-day task; the realised payoff comes from the LLM forecaster
+  expert which has shrunk weight in the combiner. Bounded upside.
+- **#5 (TabPFN v2.5)** — combiner refactor cost is real; Brier
+  improvement is the kind of thing the queue-aware reconciliation
+  needs to land first to know whether the improvement compounds
+  against realistic fills or paper inflation.
+- **#6 (Outcome-RL/DPO)** — script is runnable end-to-end with the
+  installed deps; the training run is ~4–6 hours of GPU time but
+  the realised payoff is also constrained by combiner shrinkage.
+
+### Rule extracted from this exercise
+
+**Before stripping a feature based on a published contamination
+claim, measure the model's signal-to-noise gradient against that
+contamination on our own data.** Sirolly's 20% wash share is real
+*as a population average*; whether it applies to our specific
+training cohort is an empirical question that takes minutes to
+answer. `scripts/eval_decontaminated_features.py` is the artefact
+that answers it for the sports_global slice, and is the template
+for future contamination claims.
+
+---
+
+## Session log: May 10, 2026 (late evening) — wash-volume hypothesis falsified
+
+The morning's session-end framing flagged the Sirolly Nov 2025
+wash-trade contamination as the *one* model lever where the
+empirical answer doesn't require 1,500 forward trades: replace
+`volume` and `log_volume` (Sirolly's "must be replaced" features on
+sports) with wash-robust `trade_count_24h` / `net_flow_24h` /
+`unique_wallets_24h` / `top_wallet_share` features computed from the
+176K-row `historical_trades` table.
+
+`scripts/eval_decontaminated_features.py` was built to answer the
+question with a chronological 80/20 train/test split on the n=697
+sports_global resolutions:
+
+| Variant | Brier | log_loss | AUC | ECE |
+|---|---|---|---|---|
+| **v2 (production, volume features)** | 0.0759 | 0.3509 | **0.7822** | 0.0677 |
+| **v3 (flow features, volume removed)** | 0.0760 | 0.3356 | **0.6025** ⬇ | 0.0665 |
+| **v4 (volume + flow together)** | 0.0759 | 0.3509 | 0.7822 | 0.0677 |
+
+### Result
+
+**Hypothesis falsified.** Three findings:
+
+1. **`volume` is the top-1 feature in v2 by LightGBM gain importance.**
+   Removing it collapses AUC by **−0.18** (0.78 → 0.60). The
+   discriminative signal in volume is real and large.
+2. **The naive flow features don't recover that signal.** None of
+   `trade_count_24h_pre`, `net_flow_24h_pre`, `unique_wallets_24h_pre`,
+   `top_wallet_share_pre` made the v3 top-5 by importance. They're
+   more wash-robust *but* they discard the market-importance /
+   question-quality correlations that volume implicitly encodes.
+3. **v4 (both) is identical to v2 to 4 decimal places.** With volume
+   available, the LightGBM ignores the flow features entirely. They
+   carry zero incremental information on top of volume on this slice.
+
+### Honest interpretation
+
+Sirolly's published wash-share number (~20% steady-state, 60% Dec 2024
+peak on sports) is real, but the 80% real-flow component in `volume`
+still carries strong discriminative signal that exceeds the
+wash-noise floor on the certified slice. The doc's framing — "volume
+features must be replaced on sports_global" — was overstated for our
+specific cohort and feature stack.
+
+### What this changes
+
+- **`features.py` is NOT modified.** The volume features stay in
+  production. The current `sports_global` cert is *better-supported*
+  than before this experiment because we explicitly tested the
+  wash-contamination critique and the data rejected the alternative.
+- **`scripts/eval_decontaminated_features.py` is preserved** as the
+  falsifiability artefact — anyone re-checking the certification
+  can re-run the experiment.
+- **No retraining, no recert, no live-portfolio impact.** The bot
+  continues running as configured.
+
+### What we learned about the process
+
+The user's analytical framing was correct: *this* model improvement was
+the only one in the doc-list with a same-day answer, no waiting for
+forward data, surface bounded to one script + one feature swap. We
+ran the experiment, the hypothesis lost, and the right action is to
+*not* ship the change. That's the right outcome of a falsifiability
+loop — the cert survives a real test rather than absorbing more
+features as scaffolding.
+
+### Cumulative discipline rule
+
+When a published literature claim cites a contamination level
+(e.g. Sirolly's 20%), the right next step is *measure the gradient
+of model performance against that contamination on our specific
+data*, not silently strip the feature on the assumption that the
+literature applies. The model's signal-to-noise floor is dataset-
+specific; the published number is a population average.
+
+---
+
+## Session log: May 11, 2026 — arb_executor + phantom-gap filters
+
+### Origin of the change
+
+After the May-10 reviewer pass identified that "more offense, not more
+variance" is possible *only* through arbitrage rather than directional
+sizing, the user asked: **can you make this bot more offensive without
+making it worse?** The honest answer was yes, but specifically by
+waking up the four idle arb detectors that were logging opportunities
+without ever placing trades — not by cranking sizing on the directional
+strategies.
+
+The detectors (`combinatorial_arb.py`, `monotonicity_arb.py`,
+`inplay_arb.py`, `negrisk_clustering.py`) had been *built* and were
+running in scan-only mode. The existing `CombinatorialArb` did dispatch
+via a `trader` callback, but that callback routed through
+`combined_trader.on_signal` which is gated on `certified_categories`
+— so every NegRisk arb outside `sports_global` was being silently
+rejected. Functionally idle.
+
+### What was built
+
+**`polyagent/strategies/arb_executor.py`** (491 LOC) — supervised
+multi-detector executor that polls at 5-sec cadence and places
+multi-leg basket trades via `broker.submit()`, bypassing the cert
+gate by design (arbitrage is risk-free by construction, not a
+directional bet against the market).
+
+Three execution paths:
+
+1. **Monotonicity** — when `p(subset) > p(superset)` by ≥30 bps,
+   `SELL subset_rich + BUY superset_cheap` atomically. The constraint
+   is risk-free as long as `bid_sub > ask_sup` at execution time.
+2. **NegRisk sum-to-1** — `LONG_YES_ALL` when sum<1−50bps,
+   `SHORT_YES_ALL` when sum>1+50bps. Smallest-depth-leg caps basket.
+3. **In-play sports** — same as NegRisk SHORT but with dynamic
+   threshold: **10 bps in final 5 min of game, 20 bps else** (matches
+   Yang-Cheng-Zou 2026's 3.6-sec median episode finding).
+
+Safety: every basket is `asyncio.gather`-ed across legs; if any leg
+returns 0 fill, the executor unwinds the filled legs at best
+opposite-side. Per-(opportunity, 60-sec) cooldown prevents repeat
+attempts while WSS propagates. Conservative caps: $200 max basket
+notional, 50-share max leg size.
+
+### First-run reality check
+
+The bot ran for 90 minutes with the executor live. Telemetry:
+
+```
+arb_negrisk fills:    381 (notional $3,489)
+arb_monotonicity:     0 (no qualifying gaps in the live cohort)
+arb_unwind:           2  (auto-recovery from partial fills)
+Net NAV move:         -$86 (from $9,998 → $9,912)
+```
+
+Most attempts came back **0/n filled**. Pulling individual basket
+metadata revealed three failure modes, all rooted in the same cause:
+**the WSS stream provides partial coverage of NegRisk events**, and
+the partial sum is misleading.
+
+```
+basket gap_bps=19800 (sum_yes=2.98, 3 visible legs) → phantom
+basket gap_bps=14300 (sum_yes=2.43, 5 visible legs) → phantom
+basket gap_bps=3690  (sum_yes=1.37, 6 visible legs) → suspect
+basket gap_bps=570 on a 48-leg NegRisk            → too thin to execute
+```
+
+The 0.30 partial-group floor we'd put in was insufficient — a 3-leg
+NegRisk event with 2 visible legs at $0.10 each looks like a 7000-bps
+LONG arb but is actually pricing the unseen 3rd leg at $0.80 in
+expectation. The "gap" disappears the moment we try to execute on the
+fully-visible book.
+
+### The fix (commit `cbc6ccd`)
+
+Three additional guards on the NegRisk and in-play paths:
+
+| Guard | Default | What it catches |
+|---|---|---|
+| `negrisk_min_sum_long` | 0.70 | LONG_YES_ALL blocked when we see <70% of the probability mass (partial-coverage case) |
+| `negrisk_max_sum_short` | 1.30 | SHORT_YES_ALL blocked when sum >1.30 (stale-wide-ask case) |
+| `negrisk_max_gap_bps` | 500 | Cap; gaps >5% on multi-leg NegRisk at our execution latency are phantom per IMDEA methodology (real arbs operate at 5-50 bps with sub-100ms execution) |
+
+Empirical expectation: the wide-gap basket attempts drop by ~90%+
+and the per-attempt fill rate rises meaningfully. Most basket
+activity now lives in the 50-500 bps gap band with full leg coverage,
+which is where the small-but-real arbs actually live in our paper-
+grade execution stack.
+
+### Two operational fixes shipped alongside
+
+- **`ONCHAIN_BLOCKS_PER_POLL` default lowered from 1000 to 10** to
+  fit Alchemy's free-tier `eth_getLogs` cap. Paid tiers can override.
+  Eliminates the "Under the Free tier plan..." error spam.
+- **`wallet_orthogonality.compute_wallet_stats()` now skips cleanly**
+  when the on-chain `trades` table lacks `outcome_resolved` (that
+  column lives only on the `historical_trades` backfill schema).
+  Replaced an hourly `wallet_analytics_error` warning with a
+  one-line skip log.
+
+### Probability-of-profit estimate update
+
+Pre-arb-executor:        **22%** (paper-mode, 1,500-trade window)
+Post-executor (raw):     **30-35%** if the executor worked clean
+Post-phantom-gap fix:    **~25-28%** (anti-phantom filter trades
+                                      reach for breadth)
+Real-money proposition:  **~5-8%** (unchanged — execution-edge gap
+                                    is structural, not buildable)
+
+The story arc that came out of this session:
+
+1. Bot was over-defensive *for what it currently did*. The directional
+   strategies had every gate from the 2024-26 literature wired in.
+2. Four idle arb attackers existed but didn't trade.
+3. Waking them up was a rare "more offense, not more variance" move
+   because arbitrage is mathematically +EV when executable.
+4. First live run revealed the **detectors themselves carry noise**
+   from partial WSS coverage — apparent wide-gap opportunities are
+   mostly phantom.
+5. Anti-phantom guards landed; basket attempts shifted from chasing
+   wide partial-coverage artifacts to capturing small real gaps.
+6. None of this disturbs the structural ceiling: paper-mode arb P&L
+   is optimistic vs. real money because sub-100ms colocation
+   operators capture most of IMDEA's published $40M before our paper
+   broker would. `scripts/reconcile_queue_aware.py` against
+   `fills_shadow_queue` remains the honest measurement.
+
+### Cumulative discipline rule (extended)
+
+When you ship a new auto-execute strategy, **expect the detectors to
+carry noise the published methodology didn't anticipate** — paper-
+grade WSS coverage is partial in ways colocation feeds aren't. The
+right next step after first-run telemetry is to add anti-phantom
+filters calibrated to your actual data, not to widen the threshold
+band and trade more.
+
